@@ -69,6 +69,11 @@ COPY templates/ /app/templates/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
+# hermes-boot.sh: traz o caminho público (Tailscale Funnel + g2_proxy + dashboard) e
+# encadeia o start.sh original. É o startCommand do railway.toml. Ver projects/apps/hermes/FORK.md.
+COPY hermes-boot.sh /app/hermes-boot.sh
+RUN chmod +x /app/hermes-boot.sh
+
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes
 
