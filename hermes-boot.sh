@@ -18,9 +18,9 @@ SKIP_EXEC="${SKIP_EXEC:-0}"
 TS_STATE_DIR="${TS_STATE_DIR:-/data/.tailscale}"   # --statedir (NÃO --state): precisa de DIR p/ guardar o cert do Funnel
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
 TS_TAILNET="${TS_TAILNET:-tail390702.ts.net}"
-# Node persistente do volume (state em $TS_STATE_DIR). Default = node atual 59f97fd13358 (URL do G2).
-# Só usado no fallback authkey (state perdido); com state íntegro o node mantém a própria identidade.
-TS_HOSTNAME="${TS_HOSTNAME:-59f97fd13358}"
+# Hostname FIXO do node = DNS name do Funnel (URL do G2). PRECISA ser re-fixado a cada boot
+# (seção 1a) senão o node herda o hostname ALEATÓRIO do container (hex) e a URL muda a cada deploy.
+TS_HOSTNAME="${TS_HOSTNAME:-hermes-g2}"
 TS_FQDN="${TS_HOSTNAME}.${TS_TAILNET}"
 DASH_PORT="${FUNNEL_DASH_PORT:-9121}"
 G2_PORT="${G2_PROXY_PORT:-8655}"
@@ -75,6 +75,11 @@ else
     log "WARN: tailscale offline e TS_AUTHKEY ausente — Funnel ficará indisponível"
   fi
 fi
+
+# 1a) Fixa o hostname (= DNS name do Funnel) a um valor ESTÁVEL toda vez. CRÍTICO: o node key
+#     persiste no /data, mas o DNS name segue o HostName do container (hex aleatório por deploy);
+#     sem re-fixar, a URL do G2 muda a cada redeploy. `tailscale set` é não-disruptivo.
+if running; then run "ts set --hostname='$TS_HOSTNAME'"; [ "$DRY_RUN" = "1" ] || sleep 2; fi
 
 # 1b) Aquece o cert TLS do Funnel (idempotente). Depende do --statedir acima; sem warm-up o 1º
 #     handshake externo pode falhar. Best-effort + timeout (1ª emissão ACME pode demorar num
