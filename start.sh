@@ -11,6 +11,19 @@ mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
          /data/.hermes/workspace /data/.hermes/skins /data/.hermes/plans \
          /data/.hermes/home
 
+# Stamp the install method as "docker" so hermes treats this as an immutable
+# container image, not a pip checkout. hermes's detect_install_method() reads
+# $HERMES_HOME/.install_method FIRST (before any .git / pip fallback). Without
+# this stamp the template falls through to "pip" — because the Dockerfile strips
+# /opt/hermes-agent/.git — and the dashboard's "Update Hermes" button then runs
+# a real `hermes update` (PyPI pip-upgrade) INSIDE the running container. That
+# upgrade is ephemeral (reverts on the next redeploy) and can desync the Python
+# package from the image's pre-built web_dist/ui-tui bundles. Stamping "docker"
+# makes that button correctly refuse with "pull a fresh image / redeploy", which
+# matches the real upgrade path here (bump HERMES_REF in Railway + redeploy).
+# Written unconditionally each boot so it stays correct and self-heals.
+printf 'docker\n' > /data/.hermes/.install_method
+
 if [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
   cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
 fi

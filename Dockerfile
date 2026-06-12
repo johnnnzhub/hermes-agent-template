@@ -8,7 +8,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.5.29.2
+ARG HERMES_REF=v2026.6.5
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -30,15 +30,18 @@ RUN apt-get update && \
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
 #
-# [all] in v2026.5.29.2: cron, cli, dev, pty, mcp, homeassistant, sms, acp,
-# google, web, youtube. Messaging platforms, TTS, and other heavy backends
-# are now lazy-installed by hermes at first use. We pre-install the ones
-# this template actually uses so first-message latency is instant.
+# [all] in v2026.6.5 no longer pulls in [dev]; messaging platforms, TTS, and
+# other heavy backends are lazy-installed by hermes at first use. We pre-install
+# the ones this template actually uses so first-message latency is instant.
+# `vision` (Pillow) is a soft-dep that is NOT in [all] and is otherwise
+# lazy-installed at first image use: without it hermes can't downscale an
+# oversized image (>5 MB / >8000px), which then bakes into immutable history
+# and bricks the session on Anthropic's non-retryable 400. We bake it in.
 # When bumping HERMES_REF, re-check hermes-agent's pyproject.toml [all] and
 # the extras below against the new release's pyproject.toml.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight]" && \
+    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
     npm run build && \
