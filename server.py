@@ -648,7 +648,7 @@ def guard(request: Request) -> Response | None:
 LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hermes Agent — Sign in</title>
+<title>Iris Agent — Sign in</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -678,7 +678,7 @@ button:hover{background:#7b8fff;border-color:#7b8fff}
 <body>
 <div class="card">
   <div class="brand">
-    <div class="brand-logo">hermes<span>/admin</span></div>
+    <div class="brand-logo">iris<span>/admin</span></div>
     <div class="brand-sub">Sign in to continue</div>
   </div>
   __ERROR__
@@ -1140,8 +1140,8 @@ a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
 padding:7px 14px;font-size:12px;display:inline-block}
 a:hover{border-color:#6272ff}</style></head>
 <body><div class="card">
-<h1>⚠ Hermes dashboard unavailable</h1>
-<p>The native Hermes dashboard is not responding on port %d.<br>
+<h1>⚠ Iris dashboard unavailable</h1>
+<p>The native Iris dashboard is not responding on port %d.<br>
 It may still be starting up, or it may have crashed.</p>
 <p>Try refreshing in a few seconds, or head back to setup.</p>
 <a href="/setup">← Back to Setup</a>
