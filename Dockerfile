@@ -69,6 +69,8 @@ RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
+COPY deploy-config.yaml /app/deploy-config.yaml
+COPY soul.md /app/soul.md
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 

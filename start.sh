@@ -24,11 +24,47 @@ mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
 # Written unconditionally each boot so it stays correct and self-heals.
 printf 'docker\n' > /data/.hermes/.install_method
 
-if [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
+# Codex OAuth (assistente dev): seeda ~/.codex/auth.json a partir da env var
+# CODEX_AUTH_B64 (Railway) na PRIMEIRA vez. HOME=/data (ver Dockerfile), então
+# isto é /data/.codex/auth.json — NO VOLUME PERSISTENTE. Só escreve se ainda não
+# existe: depois disso o hermes gerencia o arquivo (refresh do token rotaciona
+# tanto este quanto /data/.hermes/auth.json, ambos persistentes), e sobrescrever
+# a cada boot poderia restaurar um refresh token stale. O hermes importa essas
+# credenciais pro auth store no load_pool — agent/credential_sources.py _seed_from_singletons.
+if [ -n "${CODEX_AUTH_B64:-}" ] && [ ! -f "$HOME/.codex/auth.json" ]; then
+  mkdir -p "$HOME/.codex"
+  printf '%s' "$CODEX_AUTH_B64" | base64 -d > "$HOME/.codex/auth.json"
+  chmod 600 "$HOME/.codex/auth.json"
+fi
+
+# Config gerenciado: aplica o deploy-config.yaml versionado (provider openai-codex,
+# model gpt-5.5, fallback + auxiliary em OpenRouter) a CADA boot. Self-heal da trap
+# do write_config_yaml em server.py — salvar na UI /setup re-força provider "auto",
+# mas o próximo boot restaura o provider correto a partir deste arquivo.
+if [ -f /app/deploy-config.yaml ]; then
+  cp /app/deploy-config.yaml /data/.hermes/config.yaml
+elif [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
   cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
 fi
 
+# Persona: SOUL.md ocupa o slot #1 do system prompt (identidade do agente).
+# Gerenciada pelo repo (projects/agents/hermes/soul.md) — sobrescreve a cada boot.
+# Para ajustar a persona, edite o soul.md no repo e faça novo deploy.
+if [ -f /app/soul.md ]; then
+  cp /app/soul.md /data/.hermes/SOUL.md
+fi
+
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
+
+# is_config_complete() em server.py lê LLM_MODEL do /data/.hermes/.env — mantém em
+# sync com a env var LLM_MODEL do Railway (gpt-5.5) sem precisar salvar pela UI.
+if [ -n "${LLM_MODEL:-}" ]; then
+  if grep -q '^LLM_MODEL=' /data/.hermes/.env; then
+    sed -i "s|^LLM_MODEL=.*|LLM_MODEL=${LLM_MODEL}|" /data/.hermes/.env
+  else
+    printf 'LLM_MODEL=%s\n' "$LLM_MODEL" >> /data/.hermes/.env
+  fi
+fi
 
 # Bootstrap OAuth tokens from env var (e.g. xAI Grok SuperGrok).
 # Set HERMES_AUTH_JSON_BOOTSTRAP to the contents of a locally-generated

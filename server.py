@@ -49,6 +49,7 @@ from starlette.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 from starlette.routing import Route, WebSocketRoute
 from starlette.templating import Jinja2Templates
@@ -1215,6 +1216,123 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     )
 
 
+# ── OpenAI-compatible API server proxy (óculos Even G2) ───────────────────────
+# The native hermes `api_server` platform (gateway/platforms/api_server.py) serves
+# OpenAI-compatible /v1/* on loopback API_SERVER_PORT and runs the FULL agent with
+# its MCP toolset. We reverse-proxy it on the public Railway port so the Even G2
+# glasses (and any OpenAI-compatible client) reach https://<domain>/v1 with
+# `Authorization: Bearer <API_SERVER_KEY>`.
+#
+# Auth: the api_server validates the bearer itself (hmac.compare_digest). This
+# route is PUBLIC at the edge (no cookie guard) — the bearer IS the gate. Fail-safe:
+# if API_SERVER_KEY is unset we refuse to proxy (503), since the api_server runs an
+# agent with tools and exposing it unauthenticated would be remote code execution.
+#
+# Streaming: we stream the upstream response through unbuffered so stream:true
+# (SSE) works AND stream:false returns a single JSON body. The dashboard proxy
+# buffers the whole body and would break SSE, so this is a dedicated path.
+API_SERVER_HOST = "127.0.0.1"
+API_SERVER_PORT = int(os.environ.get("API_SERVER_PORT", "8642"))
+API_SERVER_URL = f"http://{API_SERVER_HOST}:{API_SERVER_PORT}"
+
+# Layered (by api_server's ephemeral_system_prompt) on top of the core prompt for
+# THIS channel only — keeps replies HUD-sized without touching SOUL.md or other
+# channels (dashboard/WhatsApp stay verbose).
+_G2_BREVITY_PROMPT = (
+    "Você está respondendo pelos óculos Even G2: tela minúscula, leitura por voz. "
+    "Responda em PT-BR, no máximo ~400 caracteres, texto puro — sem markdown, listas, "
+    "tabelas ou emoji — e direto ao ponto. Se a tarefa for longa, faça o essencial e "
+    "devolva um resumo curto."
+)
+
+
+def _inject_brevity(body: bytes) -> bytes:
+    """Prepend the G2 brevity system prompt to a chat/completions or responses body.
+
+    Fail-open: any parse error returns the body unchanged so a malformed request
+    still reaches the agent (which will 400 it) instead of us masking it.
+    """
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return body
+        msgs = payload.get("messages")
+        if isinstance(msgs, list):
+            # Chat Completions — api_server merges every system message into the
+            # ephemeral prompt, so an extra leading one is safe.
+            payload["messages"] = [{"role": "system", "content": _G2_BREVITY_PROMPT}, *msgs]
+            return json.dumps(payload).encode("utf-8")
+        if "input" in payload:  # Responses API
+            existing = payload.get("instructions") or ""
+            payload["instructions"] = _G2_BREVITY_PROMPT + (f"\n\n{existing}" if existing else "")
+            return json.dumps(payload).encode("utf-8")
+    except Exception:
+        pass
+    return body
+
+
+async def route_api_v1(request: Request) -> Response:
+    """Public reverse-proxy: /v1/* → loopback hermes api_server (OpenAI-compatible).
+
+    No cookie guard — the upstream api_server's Bearer auth is the gate. Refuses
+    with 503 when API_SERVER_KEY is unset to avoid exposing an unauthenticated agent.
+    """
+    if not os.environ.get("API_SERVER_KEY"):
+        return JSONResponse(
+            {"error": "API server disabled — API_SERVER_KEY not configured"},
+            status_code=503,
+        )
+
+    target = f"{API_SERVER_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+    body = await request.body()
+
+    if request.method == "POST" and request.url.path in ("/v1/chat/completions", "/v1/responses"):
+        body = _inject_brevity(body)
+        req_headers.pop("content-length", None)  # body length changed — httpx recomputes
+
+    client = get_http_client()
+    # Agent-with-tools turns can run long; allow a generous read but bounded connect.
+    timeout = httpx.Timeout(300.0, connect=5.0)
+
+    try:
+        upstream_req = client.build_request(
+            request.method, target, headers=req_headers, content=body, timeout=timeout
+        )
+        upstream = await client.send(upstream_req, stream=True)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return JSONResponse(
+            {"error": "api_server unavailable — gateway starting or stopped"},
+            status_code=503,
+        )
+    except httpx.RequestError as e:
+        print(f"[v1-proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+        return JSONResponse({"error": "upstream error"}, status_code=502)
+
+    # Keep content-encoding (we forward raw bytes); drop content-length (we stream chunked).
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+    }
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
 async def route_root(request: Request) -> Response:
     """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
 
@@ -1469,6 +1587,11 @@ routes = [
     # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
     # WS endpoints in future hermes releases proxy without re-touching this list.
     WebSocketRoute("/api/plugins/{path:path}",  ws_proxy),
+
+    # OpenAI-compatible API for the Even G2 glasses — PUBLIC at the edge (bearer
+    # auth is enforced upstream by the native api_server). Must precede the
+    # catch-all so /v1/* hits the loopback api_server, not the dashboard.
+    Route("/v1/{path:path}",                    route_api_v1,        methods=ANY_METHOD),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),

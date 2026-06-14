@@ -1,0 +1,73 @@
+model:
+  default: "gpt-5.5"
+  provider: "openai-codex"
+
+# Fallback: se o Codex (janela Plus) falhar/estourar, cai pro OpenRouter barato.
+fallback_providers:
+  - provider: "openrouter"
+    model: "google/gemini-3.1-flash-lite"
+
+# Tarefas auxiliares fora da janela Plus (poupar o rate limit da assinatura).
+auxiliary:
+  vision:
+    provider: "openrouter"
+    model: "google/gemini-3.1-flash-lite"
+  web_extract:
+    provider: "openrouter"
+    model: "google/gemini-3.1-flash-lite"
+  skills_hub:
+    provider: "openrouter"
+    model: "google/gemini-3.1-flash-lite"
+  mcp:
+    provider: "openrouter"
+    model: "google/gemini-3.1-flash-lite"
+
+# MCP servers (tools do assistente dev). ${VAR} resolve do ambiente no connect —
+# os segredos ficam nas env vars do Railway, NUNCA neste arquivo versionado.
+mcp_servers:
+  # Busca web preferida do John (Sonar). stdio via npx.
+  perplexity:
+    command: "npx"
+    args: ["-y", "@perplexity-ai/mcp-server"]
+    env:
+      PERPLEXITY_API_KEY: "${PERPLEXITY_API_KEY}"
+  # Notion (token de integração interna ntn_). stdio via npx.
+  notion:
+    command: "npx"
+    args: ["-y", "@notionhq/notion-mcp-server"]
+    env:
+      NOTION_TOKEN: "${NOTION_TOKEN}"
+  # GitHub (PAT clássico ghp_). HTTP remoto — o server oficial é Docker/Go-only.
+  github:
+    url: "https://api.githubcopilot.com/mcp/"
+    headers:
+      Authorization: "Bearer ${GITHUB_TOKEN}"
+  # Composio: Gmail + Google Calendar (contas já autorizadas via OAuth no dashboard).
+  # Server hermes-google id 67f33526; user_id pg-test-230c7f08 (onde as contas Google estão ligadas).
+  composio-google:
+    url: "https://backend.composio.dev/v3/mcp/67f33526-2503-450e-9e1f-1de31294a6f7?user_id=pg-test-230c7f08-d162-42d6-99b4-118ecd358831"
+    headers:
+      x-api-key: "${COMPOSIO_API_KEY}"
+
+# Toolset do canal api_server (óculos Even G2, endpoint /v1 público). Blast-radius
+# reduzido: o bearer é a única barreira na internet, então este canal NÃO recebe
+# terminal/file/browser/delegation (evita RCE + exfil do auth.json se o token vazar).
+# MCP servers (Notion/Gmail/Calendar/Perplexity/GitHub) entram AUTOMATICAMENTE —
+# não listar nomes de MCP aqui mantém todos habilitados (allowlist só se listados).
+# O dashboard (cookie, só John) segue com toolset full.
+platform_toolsets:
+  api_server:
+    - web
+    - memory
+    - skills
+
+agent:
+  max_iterations: 50
+  reasoning_effort: "medium"
+
+terminal:
+  backend: local
+  timeout: 60
+  cwd: /tmp
+
+data_dir: /data/.hermes
