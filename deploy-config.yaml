@@ -2,10 +2,15 @@ model:
   default: "gpt-5.5"
   provider: "openai-codex"
 
-# Fallback: se o Codex (janela Plus) falhar/estourar, cai pro OpenRouter barato.
+# Cadeia de resiliência (tentada em ordem): Codex (oficial, acima) → OpenRouter (Claude).
+# NÃO usar Gemini: rejeita schemas de algumas tools MCP (ex: GitHub `issue_fields`) com 400
+# INVALID_ARGUMENT → o agente falha toda rodada que carrega tools. Claude/Codex engolem numa boa.
+# Anthropic direto (assinatura) FORA da cadeia por ora (decisão 2026-06-16): exige Claude Max +
+# créditos extras comprados + bug upstream #15080. Re-adicionar como `provider: "anthropic"` no
+# topo da lista se/quando os créditos existirem. OpenRouter usa a OPENROUTER_API_KEY já configurada.
 fallback_providers:
   - provider: "openrouter"
-    model: "google/gemini-3.1-flash-lite"
+    model: "anthropic/claude-sonnet-4.6"
 
 # Tarefas auxiliares fora da janela Plus (poupar o rate limit da assinatura).
 auxiliary:

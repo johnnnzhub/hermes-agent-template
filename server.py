@@ -221,11 +221,28 @@ def write_config_yaml(data: dict[str, str]) -> None:
     # Deployment-managed (always authoritative — these reflect the runtime env).
     merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
     merged_model["default"] = model
-    # Only force provider="auto" when a known API key is configured. If no
-    # API key is set, the user likely configured an OAuth provider (xai-oauth,
-    # qwen-oauth, etc.) via the dashboard's model picker — preserve that value
-    # so a container restart doesn't revert it to "auto" and break their session.
-    if any(data.get(k) for k in PROVIDER_KEYS):
+    # Provider precedence: the deployment-pinned provider in deploy-config.yaml is
+    # AUTHORITATIVE and wins even when an API key (e.g. OPENROUTER_API_KEY) is set in
+    # the env. start.sh copies that file to config.yaml each boot pinning e.g.
+    # "openai-codex"; reading it directly here keeps this in sync with production.
+    # Without this, the force-"auto" path below mis-resolved codex-only models like
+    # gpt-5.5 to the wrong provider (Nous Portal → 404). Fall back to "auto" only
+    # when deploy-config pins no provider AND a known API key is configured.
+    deploy_provider = ""
+    deploy_path = Path(__file__).parent / "deploy-config.yaml"
+    if deploy_path.exists():
+        try:
+            with deploy_path.open() as f:
+                deploy_cfg = yaml.safe_load(f)
+            if isinstance(deploy_cfg, dict):
+                deploy_model = deploy_cfg.get("model")
+                if isinstance(deploy_model, dict) and deploy_model.get("provider"):
+                    deploy_provider = str(deploy_model["provider"]).strip()
+        except (yaml.YAMLError, OSError):
+            deploy_provider = ""
+    if deploy_provider:
+        merged_model["provider"] = deploy_provider
+    elif any(data.get(k) for k in PROVIDER_KEYS):
         merged_model["provider"] = "auto"
     merged["model"] = merged_model
 

@@ -1,0 +1,104 @@
+{
+  "name": "Iris G2 bridge",
+  "nodes": [
+    {
+      "id": "webhook",
+      "name": "Webhook G2",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "parameters": { "httpMethod": "POST", "path": "iris-g2", "responseMode": "responseNode", "options": {} },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "validate",
+      "name": "validate + extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst headers = item.headers || {};\nconst body = item.body || item;\n\n// rotatable; valor real fica só na instância n8n\nconst G2_TOKEN = '__G2_TOKEN__';\nconst auth = headers.authorization || headers.Authorization || '';\n\nif (G2_TOKEN && auth !== `Bearer ${G2_TOKEN}`) {\n  return [{ json: { ok: false, payload: { error: { message: 'Acesso nao autorizado.', type: 'auth_error' } } } }];\n}\n\nconst messages = Array.isArray(body.messages) ? body.messages : (Array.isArray(item.messages) ? item.messages : []);\nlet userMessage = '';\nfor (let i = messages.length - 1; i >= 0; i--) {\n  const m = messages[i];\n  if (m && m.role === 'user' && m.content) { userMessage = String(m.content); break; }\n}\nif (!userMessage && body.prompt) userMessage = String(body.prompt);\nif (!userMessage) userMessage = 'Mensagem vazia.';\n\nreturn [{ json: { ok: true, userMessage } }];"
+      }
+    },
+    {
+      "id": "ifauth",
+      "name": "authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.ok }}", "rightValue": "", "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "respond401",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 480],
+      "parameters": { "respondWith": "json", "responseBody": "={{ JSON.stringify($json.payload) }}", "options": { "responseCode": 401 } }
+    },
+    {
+      "id": "calliris",
+      "name": "call Iris (hermes)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 200],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://hermes-production-bfba.up.railway.app/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'hermes-agent', stream: false, messages: [{ role: 'user', content: $json.userMessage }] }) }}",
+        "options": { "timeout": 22000 }
+      }
+    },
+    {
+      "id": "buildreply",
+      "name": "build reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 120],
+      "parameters": {
+        "jsCode": "const resp = $input.first().json;\nconst raw = String((resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) || resp.content || '');\n\nfunction sanitizeForG2(text) {\n  let out = text;\n  out = out.replace(/```[\\s\\S]*?```/g, ' ');\n  out = out.replace(/`([^`]+)`/g, '$1');\n  out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '$1');\n  out = out.replace(/\\*([^*]+)\\*/g, '$1');\n  out = out.replace(/__([^_]+)__/g, '$1');\n  out = out.replace(/_([^_]+)_/g, '$1');\n  out = out.replace(/^\\s*[-*•]\\s+/gm, '');\n  out = out.replace(/#{1,6}\\s*/g, '');\n  out = out.replace(/\\[([^\\]]+)\\]\\([^)]+\\)/g, '$1');\n  out = out.replace(/https?:\\/\\/\\S+/g, '[link]');\n  out = out.replace(/\\s+/g, ' ').trim();\n  if (!out) out = 'Não consegui responder agora. Tenta de novo em instantes.';\n  if (out.length > 300) out = out.slice(0, 297).trimEnd() + '...';\n  return out;\n}\n\nconst content = sanitizeForG2(raw);\nconst now = Math.floor(Date.now() / 1000);\nreturn [{ json: { statusCode: 200, payload: {\n  id: `chatcmpl-iris-g2-${now}`, object: 'chat.completion', created: now, model: 'iris-g2-bridge',\n  choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],\n  usage: { prompt_tokens: 0, completion_tokens: content.length, total_tokens: content.length }\n} } }];"
+      }
+    },
+    {
+      "id": "buildack",
+      "name": "build ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 320],
+      "parameters": {
+        "jsCode": "// HTTP falhou/estourou 22s (tool-call longo, credencial ausente, ou Iris offline)\nconst content = 'Tô resolvendo isso e te aviso depois.';\nconst now = Math.floor(Date.now() / 1000);\nreturn [{ json: { statusCode: 200, payload: {\n  id: `chatcmpl-iris-g2-${now}`, object: 'chat.completion', created: now, model: 'iris-g2-bridge',\n  choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],\n  usage: { prompt_tokens: 0, completion_tokens: content.length, total_tokens: content.length }\n} } }];"
+      }
+    },
+    {
+      "id": "respond200",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1100, 220],
+      "parameters": { "respondWith": "json", "responseBody": "={{ JSON.stringify($json.payload) }}", "options": { "responseCode": 200 } }
+    }
+  ],
+  "connections": {
+    "Webhook G2": { "main": [[{ "node": "validate + extract", "type": "main", "index": 0 }]] },
+    "validate + extract": { "main": [[{ "node": "authorized?", "type": "main", "index": 0 }]] },
+    "authorized?": { "main": [[{ "node": "call Iris (hermes)", "type": "main", "index": 0 }], [{ "node": "Respond 401", "type": "main", "index": 0 }]] },
+    "call Iris (hermes)": { "main": [[{ "node": "build reply", "type": "main", "index": 0 }], [{ "node": "build ack", "type": "main", "index": 0 }]] },
+    "build reply": { "main": [[{ "node": "Respond 200", "type": "main", "index": 0 }]] },
+    "build ack": { "main": [[{ "node": "Respond 200", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
