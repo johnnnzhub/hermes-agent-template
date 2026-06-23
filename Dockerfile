@@ -74,8 +74,12 @@ COPY soul.md /app/soul.md
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-# hermes-boot.sh: traz o caminho público (Tailscale Funnel + g2_proxy + dashboard) e
-# encadeia o start.sh original. É o startCommand do railway.toml. Ver projects/apps/hermes/FORK.md.
+# hostproxy.py: reverse proxy loopback com Host-rewrite (HTTP+WS) entre o
+# `tailscale serve` (tailnet) e o dashboard em 127.0.0.1:9119. Iniciado pelo hermes-boot.sh.
+COPY hostproxy.py /app/hostproxy.py
+
+# hermes-boot.sh: sobe Tailscale userspace (tailnet-only) + hostproxy e encadeia
+# o start.sh original. É o startCommand do railway.toml. Ver projects/apps/hermes/FORK.md.
 COPY hermes-boot.sh /app/hermes-boot.sh
 RUN chmod +x /app/hermes-boot.sh
 
