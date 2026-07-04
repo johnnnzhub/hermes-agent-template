@@ -1350,6 +1350,73 @@ async def route_api_v1(request: Request) -> Response:
     )
 
 
+# ── Hermes Glass API — plugin Iris Glass nos óculos G2 (fase 0.2.x) ──────────
+# Adaptador fino read-only: /glass/tasks consulta o gateway n8n g2-fluxo
+# (?action=tasks — mesma fonte battle-tested do plugin HQ) e devolve linhas
+# display-ready para o HUD. Contrato acordado com a Iris (2026-07-03):
+#   200 → { ok, lines ["» ...", ≤6, ≤42 chars], ids [paralelo], updated_at ISO }
+#   401 → Bearer ausente/errado · 502 → upstream n8n falhou · 503 → sem config
+# Auth: Bearer GLASS_TOKEN (env dedicada, escopo só /glass/*) — nunca o cookie
+# admin nem a API_SERVER_KEY. Fail-safe igual ao /v1: sem env → 503.
+GLASS_TOKEN = os.environ.get("GLASS_TOKEN", "")
+G2_TASKS_URL = os.environ.get("G2_TASKS_URL", "https://n8n.cobaiateam.com.br/webhook/g2-fluxo")
+G2_TASKS_TOKEN = os.environ.get("G2_TASKS_TOKEN", "")
+
+
+def _glass_line(name: str) -> str:
+    """Linha display-ready pro HUD: glifo » + clamp em 42 chars (largura útil)."""
+    text = re.sub(r"\s+", " ", name).strip()
+    line = f"» {text}"
+    return line[:41] + "…" if len(line) > 42 else line
+
+
+async def route_glass_tasks(request: Request) -> Response:
+    if not GLASS_TOKEN or not G2_TASKS_TOKEN:
+        return JSONResponse(
+            {"ok": False, "error": "glass API disabled — GLASS_TOKEN/G2_TASKS_TOKEN not configured"},
+            status_code=503,
+        )
+    auth = request.headers.get("authorization", "")
+    if not _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+    try:
+        limit = int(request.query_params.get("limit", "5"))
+    except ValueError:
+        limit = 5
+    limit = max(1, min(6, limit))
+
+    client = get_http_client()
+    try:
+        upstream = await client.get(
+            G2_TASKS_URL,
+            params={"action": "tasks"},
+            headers={"authorization": f"Bearer {G2_TASKS_TOKEN}"},
+            timeout=httpx.Timeout(15.0, connect=5.0),
+        )
+    except httpx.RequestError as e:
+        print(f"[glass] tasks upstream error: {e!r}", flush=True)
+        return JSONResponse({"ok": False, "error": "upstream unavailable"}, status_code=502)
+
+    if upstream.status_code != 200:
+        print(f"[glass] tasks upstream -> {upstream.status_code}", flush=True)
+        return JSONResponse({"ok": False, "error": f"upstream {upstream.status_code}"}, status_code=502)
+
+    try:
+        data = upstream.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid upstream payload"}, status_code=502)
+
+    open_tasks = data.get("open") if isinstance(data.get("open"), list) else []
+    picked = [t for t in open_tasks if isinstance(t, dict) and t.get("id") and t.get("name")][:limit]
+    return JSONResponse({
+        "ok": True,
+        "lines": [_glass_line(str(t["name"])) for t in picked],
+        "ids": [str(t["id"]) for t in picked],
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+
+
 async def route_root(request: Request) -> Response:
     """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
 
@@ -1609,6 +1676,10 @@ routes = [
     # auth is enforced upstream by the native api_server). Must precede the
     # catch-all so /v1/* hits the loopback api_server, not the dashboard.
     Route("/v1/{path:path}",                    route_api_v1,        methods=ANY_METHOD),
+
+    # Hermes Glass API (óculos G2, plugin Iris Glass) — PUBLIC at the edge,
+    # Bearer GLASS_TOKEN enforced in-handler. Must precede the catch-all.
+    Route("/glass/tasks",                       route_glass_tasks,   methods=["GET"]),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),

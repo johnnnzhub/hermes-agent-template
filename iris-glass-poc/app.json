@@ -2,7 +2,7 @@
   "package_id": "com.cobaiateam.iris.glasses",
   "edition": "202601",
   "name": "Iris Glass",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
@@ -11,7 +11,7 @@
     {
       "name": "network",
       "desc": "Enviar comandos para a Hermes Glass API.",
-      "whitelist": ["http://localhost:8787", "http://127.0.0.1:8787", "https://iris.cobaiateam.com"]
+      "whitelist": ["https://hermes-production-bfba.up.railway.app"]
     }
   ],
   "supported_languages": ["en"]

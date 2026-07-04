@@ -19,14 +19,21 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, service: 'iris-glass-api-mock' })
   }
 
-  if (req.method === 'GET' && req.url === '/glass/tasks') {
+  if (req.method === 'GET' && req.url.startsWith('/glass/tasks')) {
+    // Contrato 0.2.0: lines display-ready (», ≤42 chars) + ids paralelo.
+    const url = new URL(req.url, `http://localhost:${port}`)
+    const limit = Math.max(1, Math.min(6, Number(url.searchParams.get('limit')) || 5))
+    const all = [
+      { id: 'mock-1', line: '» Preparar posts da semana' },
+      { id: 'mock-2', line: '» Revisar próximas tarefas' },
+      { id: 'mock-3', line: '» Validar Iris Glass no G2' },
+    ]
+    const picked = all.slice(0, limit)
     return json(res, 200, {
-      tasks: [
-        { id: 'mock-1', title: 'Preparar posts da semana', priority: '!!!' },
-        { id: 'mock-2', title: 'Revisar próximas tarefas', priority: '!!' },
-        { id: 'mock-3', title: 'Validar Iris Glass no G2', priority: '!' },
-      ],
-      glass_short: '3 tarefas: posts, revisar lista, validar G2.',
+      ok: true,
+      lines: picked.map(t => t.line),
+      ids: picked.map(t => t.id),
+      updated_at: new Date().toISOString(),
     })
   }
 

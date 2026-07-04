@@ -12,25 +12,26 @@ import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
-// 'Ouvindo' é proibida NA FASE MOCK (spec do smoke: build mock nunca mostra
-// estado de escuta). Quando o STT real entrar (VITE_STT_PROVIDER != mock),
-// 'Ouvindo...' vira string legítima de produção — remover daqui nessa hora.
-// 'http://'/'https://' idem: o smoke não tem NENHUMA URL baked; um leak de
-// VITE_GLASS_API_BASE do shell entraria silencioso sem este guard. Quando a
-// API real for ligada de propósito, remover as duas entradas de URL.
+// FASE 0.2.x: 'http://'/'https://' saíram da FORBIDDEN (decisão consciente com
+// a Iris — API real ligada de propósito); ENTRAM 'localhost'/'127.0.0.1' (URL
+// de dev nunca pode vazar em build final). 'Ouvindo' segue proibida até o STT
+// real entrar (aí vira string legítima de produção — remover nessa hora).
 const FORBIDDEN = [
   'Ouvindo',
   'Evento:',
   'Sem evento de toque',
-  'Tap recebido',
   'evento vazio',
   'Iris DIAG',
-  'http://',
-  'https://',
+  'localhost',
+  '127.0.0.1',
 ]
-// Version-agnostic: o texto inicial carrega a versão (`Iris v0.1.5 pronta...`),
-// o match por sufixo não quebra a cada bump.
-const REQUIRED = ['pronta. Toque para testar.', 'Pensando...']
+// Version-agnostic: o texto inicial carrega a versão, match por sufixo não
+// quebra a cada bump. O domínio da API baked é obrigatório no build 0.2.x.
+const REQUIRED = [
+  'buscando tarefas',
+  'Sem conexão com a Iris',
+  'hermes-production-bfba.up.railway.app',
+]
 
 // Transparência das envs efetivas: o build:smoke pina tudo, mas se alguém
 // rodou `vite build` cru com VITE_* vazando do shell, isto denuncia.

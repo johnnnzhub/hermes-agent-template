@@ -1,0 +1,7 @@
+# O plugin dos óculos vive no repo mas NÃO entra na imagem (Dockerfile só COPYa
+# arquivos específicos) — excluir do upload do `railway up` (node_modules ~50MB).
+iris-glass-poc/
+g2-bridge/
+ref_only/
+ref_ui_only/
+.claude/

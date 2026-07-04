@@ -29,9 +29,12 @@ test('mock Glass API health, tasks and intent contracts', async () => {
     const health = await fetch(`http://localhost:${port}/glass/health`).then(r => r.json())
     assert.equal(health.ok, true)
 
-    const tasks = await fetch(`http://localhost:${port}/glass/tasks`).then(r => r.json())
-    assert.equal(Array.isArray(tasks.tasks), true)
-    assert.equal(typeof tasks.glass_short, 'string')
+    const tasks = await fetch(`http://localhost:${port}/glass/tasks?scope=next&limit=2`).then(r => r.json())
+    assert.equal(tasks.ok, true)
+    assert.equal(Array.isArray(tasks.lines), true)
+    assert.equal(tasks.lines.length, 2)
+    assert.equal(tasks.ids.length, tasks.lines.length)
+    assert.ok(tasks.lines.every(l => typeof l === 'string' && l.startsWith('»') && l.length <= 42))
 
     const intent = await fetch(`http://localhost:${port}/glass/intent`, {
       method: 'POST',
