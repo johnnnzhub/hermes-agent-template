@@ -1376,9 +1376,13 @@ def _glass_line(name: str) -> str:
 # O mock da PoC já fazia isso; a rota de produção tem que espelhar.
 _GLASS_CORS = {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,OPTIONS",
+    "access-control-allow-methods": "GET,POST,OPTIONS",
     "access-control-allow-headers": "authorization,content-type",
 }
+
+# Ações permitidas no POST /glass/task — espelham o gateway n8n g2-fluxo
+# (dedup por clientMsgId; done já-concluída → already, snooze sumida → gone).
+_GLASS_ACTIONS = {"task.done", "task.snooze"}
 
 
 async def route_glass_tasks(request: Request) -> Response:
@@ -1428,6 +1432,73 @@ async def route_glass_tasks(request: Request) -> Response:
         "lines": [_glass_line(str(t["name"])) for t in picked],
         "ids": [str(t["id"]) for t in picked],
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }, headers=_GLASS_CORS)
+
+
+async def route_glass_task(request: Request) -> Response:
+    """POST /glass/task — ação done/snooze numa tarefa (plugin Iris Glass v0.3.x).
+
+    Proxy fino pro gateway n8n g2-fluxo: {action, taskId, clientMsgId} →
+    {ok, already, gone, error}. Idempotência garantida pelo dedup de
+    clientMsgId no gateway (mesmo id 2× = no-op) — o plugin retenta com o
+    MESMO id, então o retry nunca duplica escrita.
+    """
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_GLASS_CORS)
+    if not GLASS_TOKEN or not G2_TASKS_TOKEN:
+        return JSONResponse(
+            {"ok": False, "error": "glass API disabled — GLASS_TOKEN/G2_TASKS_TOKEN not configured"},
+            status_code=503,
+            headers=_GLASS_CORS,
+        )
+    auth = request.headers.get("authorization", "")
+    if not _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401, headers=_GLASS_CORS)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"ok": False, "error": "bad request"}, status_code=400, headers=_GLASS_CORS)
+    action = body.get("action")
+    task_id = body.get("taskId")
+    client_msg_id = body.get("clientMsgId")
+    if (
+        action not in _GLASS_ACTIONS
+        or not isinstance(task_id, str) or not task_id.strip()
+        or not isinstance(client_msg_id, str) or not client_msg_id.strip()
+    ):
+        return JSONResponse({"ok": False, "error": "bad request"}, status_code=400, headers=_GLASS_CORS)
+
+    client = get_http_client()
+    try:
+        upstream = await client.post(
+            G2_TASKS_URL,
+            json={"action": action, "taskId": task_id, "clientMsgId": client_msg_id},
+            headers={"authorization": f"Bearer {G2_TASKS_TOKEN}"},
+            timeout=httpx.Timeout(15.0, connect=5.0),
+        )
+    except httpx.RequestError as e:
+        print(f"[glass] task upstream error: {e!r}", flush=True)
+        return JSONResponse({"ok": False, "error": "upstream unavailable"}, status_code=502, headers=_GLASS_CORS)
+
+    if upstream.status_code != 200:
+        print(f"[glass] task upstream -> {upstream.status_code}", flush=True)
+        return JSONResponse({"ok": False, "error": f"upstream {upstream.status_code}"}, status_code=502, headers=_GLASS_CORS)
+
+    try:
+        data = upstream.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid upstream payload"}, status_code=502, headers=_GLASS_CORS)
+    if not isinstance(data, dict):
+        data = {}
+
+    return JSONResponse({
+        "ok": bool(data.get("ok")),
+        "already": bool(data.get("already")),
+        "gone": bool(data.get("gone")),
+        "error": str(data["error"]) if isinstance(data.get("error"), (str, int)) and data.get("error") else None,
     }, headers=_GLASS_CORS)
 
 
@@ -1694,6 +1765,7 @@ routes = [
     # Hermes Glass API (óculos G2, plugin Iris Glass) — PUBLIC at the edge,
     # Bearer GLASS_TOKEN enforced in-handler. Must precede the catch-all.
     Route("/glass/tasks",                       route_glass_tasks,   methods=["GET", "OPTIONS"]),
+    Route("/glass/task",                        route_glass_task,    methods=["POST", "OPTIONS"]),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),
