@@ -1370,15 +1370,29 @@ def _glass_line(name: str) -> str:
     return line[:41] + "…" if len(line) > 42 else line
 
 
+# CORS obrigatório: o WebView do Even Hub faz fetch com header Authorization,
+# que dispara preflight OPTIONS. Sem allow-origin o device bloqueia o GET antes
+# de sair ("Sem conexão" no plugin mesmo com a API saudável — incidente v0.2.0).
+# O mock da PoC já fazia isso; a rota de produção tem que espelhar.
+_GLASS_CORS = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET,OPTIONS",
+    "access-control-allow-headers": "authorization,content-type",
+}
+
+
 async def route_glass_tasks(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_GLASS_CORS)
     if not GLASS_TOKEN or not G2_TASKS_TOKEN:
         return JSONResponse(
             {"ok": False, "error": "glass API disabled — GLASS_TOKEN/G2_TASKS_TOKEN not configured"},
             status_code=503,
+            headers=_GLASS_CORS,
         )
     auth = request.headers.get("authorization", "")
     if not _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}"):
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401, headers=_GLASS_CORS)
 
     try:
         limit = int(request.query_params.get("limit", "5"))
@@ -1396,16 +1410,16 @@ async def route_glass_tasks(request: Request) -> Response:
         )
     except httpx.RequestError as e:
         print(f"[glass] tasks upstream error: {e!r}", flush=True)
-        return JSONResponse({"ok": False, "error": "upstream unavailable"}, status_code=502)
+        return JSONResponse({"ok": False, "error": "upstream unavailable"}, status_code=502, headers=_GLASS_CORS)
 
     if upstream.status_code != 200:
         print(f"[glass] tasks upstream -> {upstream.status_code}", flush=True)
-        return JSONResponse({"ok": False, "error": f"upstream {upstream.status_code}"}, status_code=502)
+        return JSONResponse({"ok": False, "error": f"upstream {upstream.status_code}"}, status_code=502, headers=_GLASS_CORS)
 
     try:
         data = upstream.json()
     except Exception:
-        return JSONResponse({"ok": False, "error": "invalid upstream payload"}, status_code=502)
+        return JSONResponse({"ok": False, "error": "invalid upstream payload"}, status_code=502, headers=_GLASS_CORS)
 
     open_tasks = data.get("open") if isinstance(data.get("open"), list) else []
     picked = [t for t in open_tasks if isinstance(t, dict) and t.get("id") and t.get("name")][:limit]
@@ -1414,7 +1428,7 @@ async def route_glass_tasks(request: Request) -> Response:
         "lines": [_glass_line(str(t["name"])) for t in picked],
         "ids": [str(t["id"]) for t in picked],
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    })
+    }, headers=_GLASS_CORS)
 
 
 async def route_root(request: Request) -> Response:
@@ -1679,7 +1693,7 @@ routes = [
 
     # Hermes Glass API (óculos G2, plugin Iris Glass) — PUBLIC at the edge,
     # Bearer GLASS_TOKEN enforced in-handler. Must precede the catch-all.
-    Route("/glass/tasks",                       route_glass_tasks,   methods=["GET"]),
+    Route("/glass/tasks",                       route_glass_tasks,   methods=["GET", "OPTIONS"]),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),
