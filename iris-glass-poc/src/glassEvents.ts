@@ -12,6 +12,8 @@
 export type GlassAction =
   | 'click'
   | 'double_click'
+  | 'scroll_up'
+  | 'scroll_down'
   | 'exit'
   | 'audio'
   | 'lifecycle'
@@ -22,6 +24,12 @@ const isClick = (v: unknown) =>
 
 const isDouble = (v: unknown) =>
   v === 3 || v === '3' || v === 'DOUBLE_CLICK_EVENT' || v === 'DOUBLE_CLICK'
+
+const isScrollUp = (v: unknown) =>
+  v === 1 || v === '1' || v === 'SCROLL_TOP_EVENT' || v === 'SCROLL_TOP'
+
+const isScrollDown = (v: unknown) =>
+  v === 2 || v === '2' || v === 'SCROLL_BOTTOM_EVENT' || v === 'SCROLL_BOTTOM'
 
 // Formas longa e curta: OsEventTypeList.fromJson do SDK aceita ambas
 // ('FOREGROUND_ENTER_EVENT' e 'FOREGROUND_ENTER') — verificado executando o SDK.
@@ -66,11 +74,13 @@ export function classifyGlassEvent(event: any): GlassAction {
   const hasInteractiveContainer =
     Boolean(event.listEvent) || Boolean(event.textEvent) || Boolean(event.sysEvent)
 
-  // Precedência defensiva: exit ganha de click — num payload combinado
-  // (container parecendo click + campo indicando SYSTEM/ABNORMAL_EXIT),
-  // encerrar/cleanup deve vencer, nunca disparar comando.
+  // Precedência defensiva: exit ganha de tudo (menos double) — num payload
+  // combinado, encerrar/cleanup vence. Scroll (1/2, sempre explícito) vence
+  // click para navegação nunca degradar em ação.
   if (candidates.some(isDouble)) return 'double_click'
   if (candidates.some(isExit)) return 'exit'
+  if (candidates.some(isScrollUp)) return 'scroll_up'
+  if (candidates.some(isScrollDown)) return 'scroll_down'
   if (candidates.some(isClick)) return 'click'
   if (candidates.some(isLifecycle)) return 'lifecycle'
 

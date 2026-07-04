@@ -31,6 +31,8 @@ const REQUIRED = [
   'buscando tarefas',
   'Sem conexão com a Iris',
   'hermes-production-bfba.up.railway.app',
+  'CONCLUIR TAREFA?',
+  'tap = concluir',
 ]
 
 // Transparência das envs efetivas: o build:smoke pina tudo, mas se alguém

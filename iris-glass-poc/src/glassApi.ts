@@ -1,66 +1,52 @@
-export interface GlassIntentRequest {
-  transcript: string
-  source: 'g2' | 'simulator' | 'dev'
-}
+// Cliente da Hermes Glass API (v0.3.x): GET /glass/tasks + POST /glass/task.
+// Conversa com a Iris NÃO passa por aqui — é o canal BYOA nativo do Even Hub
+// (decisão da PO; sendIntent/STT removidos na 0.3.0).
+//
+// Padrões portados de projects/apps/g2-fluxo/src/api.ts (battle-tested no G2):
+// fetchWithTimeout (WebView pendura fetch sem rejeitar), retry [0,1s,3s] com
+// clientMsgId ESTÁVEL (dedup no gateway: mesmo id 2× = no-op), 401/403
+// fail-fast 'token' (retry não conserta credencial).
 
-export interface GlassIntentResponse {
-  glass_short: string
-  whatsapp_full?: string
-  action?: string
-  needs_confirmation?: boolean
-}
+const ACTION_TIMEOUT_MS = 15000
+const TASKS_TIMEOUT_MS = 12000
 
-const DEFAULT_RESPONSE: GlassIntentResponse = {
-  glass_short: 'Iris pronta. Toque para falar.',
-  action: 'idle',
-}
-
-export async function sendIntent(req: GlassIntentRequest): Promise<GlassIntentResponse> {
-  const baseUrl = (import.meta.env.VITE_GLASS_API_BASE as string | undefined)?.replace(/\/$/, '')
-
-  if (!baseUrl) {
-    return {
-      glass_short: shortForDisplay(`Mock Iris: ${req.transcript || 'sem áudio'}`),
-      action: 'mock_intent',
-    }
-  }
-
-  const res = await fetch(`${baseUrl}/glass/intent`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(import.meta.env.VITE_GLASS_API_TOKEN
-        ? { authorization: `Bearer ${import.meta.env.VITE_GLASS_API_TOKEN}` }
-        : {}),
-    },
-    body: JSON.stringify(req),
-  })
-
-  if (!res.ok) {
-    throw new Error(`Glass API ${res.status}: ${await res.text()}`)
-  }
-
-  return normalizeResponse(await res.json())
-}
-
-function normalizeResponse(raw: unknown): GlassIntentResponse {
-  if (!raw || typeof raw !== 'object') return DEFAULT_RESPONSE
-  const data = raw as Partial<GlassIntentResponse>
-  return {
-    glass_short: shortForDisplay(data.glass_short || DEFAULT_RESPONSE.glass_short),
-    whatsapp_full: data.whatsapp_full,
-    action: data.action,
-    needs_confirmation: Boolean(data.needs_confirmation),
+class HttpError extends Error {
+  status: number
+  constructor(status: number) {
+    super('HTTP ' + status)
+    this.status = status
   }
 }
 
-export function shortForDisplay(text: string): string {
-  return text.replace(/\s+/g, ' ').trim().slice(0, 240)
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-// ── 0.2.0: /glass/tasks read-only ────────────────────────────────────────────
-// Contrato acordado com a Iris: lines display-ready (prefixo », ≤6, ≤42 chars)
-// + ids paralelo a lines (base das ações na 0.2.1).
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function baseUrl(): string | undefined {
+  return (import.meta.env.VITE_GLASS_API_BASE as string | undefined)?.replace(/\/$/, '')
+}
+
+function authHeaders(): Record<string, string> {
+  return import.meta.env.VITE_GLASS_API_TOKEN
+    ? { authorization: `Bearer ${import.meta.env.VITE_GLASS_API_TOKEN}` }
+    : {}
+}
+
+export function newMsgId(): string {
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+}
+
+// ── GET /glass/tasks ─────────────────────────────────────────────────────────
 
 export interface GlassTasksResponse {
   ok: boolean
@@ -71,10 +57,10 @@ export interface GlassTasksResponse {
 }
 
 export async function fetchGlassTasks(limit = 5): Promise<GlassTasksResponse> {
-  const baseUrl = (import.meta.env.VITE_GLASS_API_BASE as string | undefined)?.replace(/\/$/, '')
+  const base = baseUrl()
 
   // Fallback mock (dev/browser sem API): mantém o plugin testável offline.
-  if (!baseUrl) {
+  if (!base) {
     return {
       ok: true,
       lines: ['» Mock: preparar posts', '» Mock: revisar lista', '» Mock: validar G2'],
@@ -82,18 +68,12 @@ export async function fetchGlassTasks(limit = 5): Promise<GlassTasksResponse> {
     }
   }
 
-  const res = await fetch(`${baseUrl}/glass/tasks?scope=next&limit=${limit}`, {
-    headers: {
-      ...(import.meta.env.VITE_GLASS_API_TOKEN
-        ? { authorization: `Bearer ${import.meta.env.VITE_GLASS_API_TOKEN}` }
-        : {}),
-    },
-  })
-
-  if (!res.ok) {
-    throw new Error(`Glass API ${res.status}: ${await res.text()}`)
-  }
-
+  const res = await fetchWithTimeout(
+    `${base}/glass/tasks?scope=next&limit=${limit}`,
+    { headers: authHeaders() },
+    TASKS_TIMEOUT_MS,
+  )
+  if (!res.ok) throw new HttpError(res.status)
   return normalizeTasks(await res.json())
 }
 
@@ -113,4 +93,58 @@ function normalizeTasks(raw: unknown): GlassTasksResponse {
     updated_at: typeof data.updated_at === 'string' ? data.updated_at : undefined,
     error: typeof data.error === 'string' ? data.error : undefined,
   }
+}
+
+// ── POST /glass/task (done/snooze) ───────────────────────────────────────────
+
+export interface ActionResult {
+  ok: boolean
+  already?: boolean
+  gone?: boolean
+  error?: string
+}
+
+async function postAction(body: Record<string, unknown>): Promise<ActionResult> {
+  const base = baseUrl()
+  if (!base) return { ok: true } // mock offline: sucesso simulado
+
+  const payload = JSON.stringify(body)
+  const delays = [0, 1000, 3000]
+  let lastErr = ''
+  for (const d of delays) {
+    if (d) await sleep(d)
+    try {
+      const res = await fetchWithTimeout(
+        `${base}/glass/task`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', ...authHeaders() },
+          body: payload,
+        },
+        ACTION_TIMEOUT_MS,
+      )
+      if (!res.ok) throw new HttpError(res.status)
+      const out = await res.json()
+      return {
+        ok: out?.ok === true,
+        already: out?.already === true,
+        gone: out?.gone === true,
+        error: typeof out?.error === 'string' ? out.error : undefined,
+      }
+    } catch (e) {
+      if (e instanceof HttpError && (e.status === 401 || e.status === 403)) {
+        return { ok: false, error: 'token' }
+      }
+      lastErr = (e as Error).message || 'falha'
+    }
+  }
+  return { ok: false, error: lastErr }
+}
+
+export function taskDone(taskId: string, clientMsgId: string): Promise<ActionResult> {
+  return postAction({ action: 'task.done', taskId, clientMsgId })
+}
+
+export function taskSnooze(taskId: string, clientMsgId: string): Promise<ActionResult> {
+  return postAction({ action: 'task.snooze', taskId, clientMsgId })
 }

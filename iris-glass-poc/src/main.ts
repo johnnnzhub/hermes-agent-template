@@ -5,14 +5,14 @@ import {
   RebuildPageContainer,
 } from '@evenrealities/even_hub_sdk'
 import { classifyGlassEvent, summarizeGlassEvent } from './glassEvents'
-import { fetchGlassTasks } from './glassApi'
+import { fetchGlassTasks, taskDone, taskSnooze, newMsgId } from './glassApi'
+import { initialState, reduce, type GlassEffect, type GlassInput, type GlassState } from './glassState'
 import { mountUi, setStatus } from './ui'
 
 mountUi()
 
-// 0.2.0: read-only /glass/tasks. Sem STT, sem microfone — audioControl nunca é
-// chamado e o stream STT não existe neste build (volta na fase de STT real).
-// Diagnóstico de eventos SÓ em build explícito (VITE_GLASS_DIAG=1).
+// v0.3.0: lista + ações (done/snooze) por gesto. Conversa com a Iris = canal
+// BYOA nativo do Even Hub (sem STT/mic neste plugin — decisão da PO).
 const IS_DIAG = (import.meta.env.VITE_GLASS_DIAG as string | undefined) === '1'
 // Versão no texto inicial = prova anti-cache (Even Hub pode cachear update in-place).
 const INITIAL_TEXT = IS_DIAG
@@ -94,35 +94,111 @@ async function renderNow() {
   }
 }
 
-// Contador no header: cada refresh muda o display SEMPRE (anti-dedupe do
-// lastRender — prova de vida validada no smoke). #1 = carga inicial do boot.
-let refreshing = false
-let refreshCount = 0
+// ── Estado → display (escritor ÚNICO de currentContent) ─────────────────────
 
+let state: GlassState = initialState()
+
+function contentFor(s: GlassState): string {
+  if (s.screen === 'busy') return s.busyKind === 'snooze' ? 'Adiando...' : 'Concluindo...'
+  if (s.screen === 'action' && s.action) {
+    return [
+      'CONCLUIR TAREFA?',
+      s.action.line,
+      '',
+      'tap = concluir',
+      'scroll = adiar +1 dia',
+      '2 toques = voltar',
+    ].join('\n')
+  }
+  if (!s.loaded) return INITIAL_TEXT
+  if (s.notice) return `${s.notice}\nAtualizando...`
+  if (s.offline) return OFFLINE_TEXT
+  if (s.tasks.length === 0) return `TAREFAS #${s.refreshCount}\nNenhuma tarefa aberta.`
+  const rows = s.tasks.map((t, i) =>
+    i === s.focusIdx ? '> ' + t.line.replace(/^»\s?/, '') : t.line,
+  )
+  return [`TAREFAS #${s.refreshCount}`, ...rows].join('\n')
+}
+
+// Guard de entrada da ACTION (350ms): tap/scroll residual do firmware logo
+// após abrir a tela de ação não pode virar done/snooze acidental.
+const ACTION_ENTRY_GUARD_MS = 350
+let actionEnteredAt = 0
+
+function dispatch(input: GlassInput) {
+  const prevScreen = state.screen
+  const { state: next, effects } = reduce(state, input)
+  state = next
+  if (prevScreen !== 'action' && next.screen === 'action') actionEnteredAt = Date.now()
+  currentContent = contentFor(state)
+  scheduleGlassesRender()
+  for (const e of effects) runEffect(e)
+}
+
+function runEffect(effect: GlassEffect) {
+  switch (effect) {
+    case 'refresh':
+      void refreshTasks()
+      return
+    case 'post_done':
+      void performAction('done')
+      return
+    case 'post_snooze':
+      void performAction('snooze')
+      return
+    case 'exit':
+      cleanup()
+      bridge.shutDownPageContainer(1)
+      return
+  }
+}
+
+let refreshing = false
 async function refreshTasks() {
-  if (refreshing) return
+  if (refreshing || hudDead) return
   refreshing = true
   try {
-    const tasks = await fetchGlassTasks(5)
-    refreshCount++
-    if (!tasks.ok) {
-      currentContent = OFFLINE_TEXT
-      setStatus('error', `Glass API: ${tasks.error ?? 'erro'}`)
-    } else if (tasks.lines.length === 0) {
-      currentContent = `TAREFAS #${refreshCount}\nNenhuma tarefa aberta.`
-      setStatus('listening', `Tarefas atualizadas #${refreshCount}`)
-    } else {
-      currentContent = [`TAREFAS #${refreshCount}`, ...tasks.lines].join('\n')
-      setStatus('listening', `Tarefas atualizadas #${refreshCount}`)
-    }
+    const res = await fetchGlassTasks(5)
+    const tasks = res.ok ? res.lines.map((line, i) => ({ id: res.ids[i] ?? '', line })) : []
+    dispatch({ type: 'tasks', ok: res.ok, tasks })
+    setStatus(res.ok ? 'listening' : 'error', res.ok ? `Tarefas #${state.refreshCount}` : `Glass API: ${res.error ?? 'erro'}`)
   } catch (err) {
-    // Fail-fast com retry por gatilho humano (tap) — nunca retry automático.
-    currentContent = OFFLINE_TEXT
+    dispatch({ type: 'tasks', ok: false, tasks: [] })
     setStatus('error', `Glass API: ${(err as Error)?.message ?? err}`)
     console.error('fetchGlassTasks failed:', err)
   } finally {
     refreshing = false
-    scheduleGlassesRender()
+  }
+}
+
+let actionInFlight = false
+async function performAction(kind: 'done' | 'snooze') {
+  if (actionInFlight) return
+  const target = state.action
+  if (!target || !target.id) {
+    dispatch({ type: 'action_result', kind, ok: false, already: false, gone: true, gen: state.gen })
+    return
+  }
+  actionInFlight = true
+  const g = state.gen
+  // msgId gerado UMA vez — estável nos retries → dedup no gateway (2× = no-op).
+  const msgId = newMsgId()
+  try {
+    const res = kind === 'done' ? await taskDone(target.id, msgId) : await taskSnooze(target.id, msgId)
+    dispatch({
+      type: 'action_result',
+      kind,
+      ok: res.ok,
+      already: res.already === true,
+      gone: res.gone === true,
+      error: res.error,
+      gen: g,
+    })
+  } catch (err) {
+    dispatch({ type: 'action_result', kind, ok: false, already: false, gone: false, gen: g })
+    console.error('performAction failed:', err)
+  } finally {
+    actionInFlight = false
   }
 }
 
@@ -138,6 +214,17 @@ function cleanup() {
   unsubscribe()
 }
 
+// FOREGROUND_ENTER (4) dispara refresh silencioso; FOREGROUND_EXIT (5) não.
+function isForegroundEnter(event: any): boolean {
+  return [
+    event?.listEvent?.eventType,
+    event?.textEvent?.eventType,
+    event?.sysEvent?.eventType,
+  ].some(v => v === 4 || v === '4' || v === 'FOREGROUND_ENTER_EVENT' || v === 'FOREGROUND_ENTER')
+}
+
+const SCROLL_DEDUPE_MS = 200
+let lastScrollAt = 0
 let lastEventAt = 0
 
 const unsubscribe = bridge.onEvenHubEvent(event => {
@@ -146,20 +233,31 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     console.log('EvenHub event:', event, summarizeGlassEvent(event))
   }
 
-  switch (classifyGlassEvent(event)) {
-    case 'click':
-      if (!refreshing) {
-        currentContent = 'Atualizando...'
-        scheduleGlassesRender()
-        void refreshTasks()
-      }
-      return
+  const action = classifyGlassEvent(event)
 
+  // Firmware duplica scroll (sysEvent + textEvent em callbacks separados):
+  // dedupe global de 200ms — um gesto físico = um passo.
+  if (action === 'scroll_up' || action === 'scroll_down') {
+    const now = Date.now()
+    if (now - lastScrollAt < SCROLL_DEDUPE_MS) return
+    lastScrollAt = now
+  }
+
+  // Guard de entrada da ACTION: descarta tap/scroll nos primeiros 350ms.
+  if (
+    state.screen === 'action' &&
+    (action === 'click' || action === 'scroll_up' || action === 'scroll_down') &&
+    Date.now() - actionEnteredAt < ACTION_ENTRY_GUARD_MS
+  ) {
+    return
+  }
+
+  switch (action) {
+    case 'click':
+    case 'scroll_up':
+    case 'scroll_down':
     case 'double_click':
-      // Sem texto de despedida: rebuild (~200ms) nunca completa antes do
-      // shutdown; exitMode 1 sobe a camada de interação do OS direto.
-      cleanup()
-      bridge.shutDownPageContainer(1)
+      dispatch({ type: action })
       return
 
     case 'exit':
@@ -167,11 +265,11 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       return
 
     case 'audio':
-      // 0.2.0 não tem STT — microfone nunca é ligado; PCM residual é ignorado.
+      // Sem STT neste plugin — PCM residual é ignorado.
       return
 
     case 'lifecycle':
-      // FOREGROUND_ENTER/EXIT não altera o display.
+      if (isForegroundEnter(event)) dispatch({ type: 'foreground' })
       return
 
     default:

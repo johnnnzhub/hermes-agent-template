@@ -48,9 +48,15 @@ test('jsonData com Event_Type → classifica igual', () => {
   assert.equal(classifyGlassEvent({ jsonData: { EventType: 3 } }), 'double_click')
 })
 
-test('scroll (1/2) e IMU (8) não viram click → unknown', () => {
-  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 1 } }), 'unknown')
-  assert.equal(classifyGlassEvent({ textEvent: { eventType: 2 } }), 'unknown')
+test('scroll (1/2) número, string e formas curtas → scroll_up/scroll_down', () => {
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 1 } }), 'scroll_up')
+  assert.equal(classifyGlassEvent({ textEvent: { eventType: 2 } }), 'scroll_down')
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: '1' } }), 'scroll_up')
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 'SCROLL_TOP_EVENT' } }), 'scroll_up')
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 'SCROLL_BOTTOM' } }), 'scroll_down')
+})
+
+test('IMU (8) não vira click → unknown', () => {
   assert.equal(classifyGlassEvent({ sysEvent: { eventType: 8 } }), 'unknown')
 })
 
@@ -77,11 +83,17 @@ test('jsonData como string JSON não parseada → classifica; string inválida �
 })
 
 // Firmware pode duplicar um gesto em containers distintos no mesmo callback.
-// Precedência blindada: double > exit > click > lifecycle (exit ganha de
-// click — payload combinado nunca dispara comando em vez de encerrar).
+// Precedência blindada: double > exit > scroll > click > lifecycle.
 test('containers simultâneos respeitam precedência', () => {
   assert.equal(classifyGlassEvent({ textEvent: { eventType: 0 }, sysEvent: { eventType: 3 } }), 'double_click')
   assert.equal(classifyGlassEvent({ sysEvent: { eventType: 4 }, textEvent: { eventType: 0 } }), 'click')
   assert.equal(classifyGlassEvent({ sysEvent: { eventType: 7 }, textEvent: { eventType: 0 } }), 'exit')
   assert.equal(classifyGlassEvent({ sysEvent: { eventType: 6 }, textEvent: {} }), 'exit')
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 1 }, textEvent: { eventType: 0 } }), 'scroll_up')
+  assert.equal(classifyGlassEvent({ sysEvent: { eventType: 3 }, textEvent: { eventType: 2 } }), 'double_click')
+})
+
+test('regressão: fallback protobuf-omite-0 intacto após scroll', () => {
+  assert.equal(classifyGlassEvent({ sysEvent: {} }), 'click')
+  assert.equal(classifyGlassEvent({ textEvent: {} }), 'click')
 })
