@@ -1,0 +1,29 @@
+{
+  "name": "iris-glass",
+  "private": true,
+  "version": "0.1.6",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "build:smoke": "VITE_GLASS_DIAG=0 VITE_GLASS_API_BASE= VITE_STT_PROVIDER=mock VITE_STT_API_KEY= npm run build",
+    "pack": "npm run build:smoke && npm run check:bundle && evenhub pack app.json dist -o iris-glass.ehpk",
+    "build:diag": "tsc --noEmit && VITE_GLASS_DIAG=1 vite build",
+    "pack:diag": "npm run build:diag && evenhub pack app.json dist -o iris-glass-diag.ehpk",
+    "check:bundle": "node scripts/assert-clean-glass-bundle.mjs",
+    "simulate": "evenhub-simulator http://localhost:5173",
+    "mock-api": "node mock-glass-api.mjs",
+    "test:api": "node --test test/glass-api.test.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.10"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "^0.1.12",
+    "@evenrealities/evenhub-simulator": "^0.7.2",
+    "typescript": "^5.7.0",
+    "vite": "^5.4.0"
+  }
+}
