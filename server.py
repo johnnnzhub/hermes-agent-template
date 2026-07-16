@@ -342,6 +342,29 @@ def _has_xai_oauth_tokens() -> bool:
         return False
 
 
+def _has_codex_oauth_tokens() -> bool:
+    """True when Codex OAuth credentials exist (~/.codex/auth.json).
+
+    Seeded by start.sh from CODEX_AUTH_B64 and refreshed in place by hermes.
+    Without this check is_config_complete() only knows API-key providers
+    (.env) and xAI OAuth, so a Codex-only deployment never auto-starts the
+    gateway after a redeploy (incident 2026-07-16: ~35min down until a
+    manual POST /setup/api/gateway/start).
+    """
+    auth_path = Path.home() / ".codex" / "auth.json"
+    if not auth_path.exists():
+        return False
+    try:
+        data = json.loads(auth_path.read_text())
+        tokens = data.get("tokens") or {}
+        has_oauth = isinstance(tokens, dict) and bool(
+            tokens.get("refresh_token") or tokens.get("access_token")
+        )
+        return has_oauth or bool(data.get("OPENAI_API_KEY"))
+    except Exception:
+        return False
+
+
 def _save_xai_auth_json(tokens: dict) -> None:
     """Write xAI OAuth tokens to auth.json in hermes's expected format."""
     auth_path = Path(HERMES_HOME) / "auth.json"
@@ -568,8 +591,14 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """
     if data is None:
         data = read_env(ENV_FILE)
-    has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_xai_oauth_tokens()
+    # start.sh keeps LLM_MODEL in sync between the Railway env var and .env;
+    # accept either source (a mangled .env line can hide the key from read_env).
+    has_model = bool(data.get("LLM_MODEL") or os.environ.get("LLM_MODEL"))
+    has_provider = (
+        any(data.get(k) for k in PROVIDER_KEYS)
+        or _has_xai_oauth_tokens()
+        or _has_codex_oauth_tokens()
+    )
     return has_model and has_provider
 
 
@@ -1535,6 +1564,7 @@ async def route_setup_404(request: Request) -> Response:
 # ── App lifecycle ─────────────────────────────────────────────────────────────
 async def auto_start():
     if is_config_complete():
+        print("[server] Config complete — auto-starting gateway.", flush=True)
         asyncio.create_task(gw.start())
     else:
         print("[server] Config incomplete — gateway not started. Configure provider + model in the admin UI.", flush=True)
