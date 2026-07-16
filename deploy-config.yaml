@@ -66,6 +66,14 @@ platform_toolsets:
     - memory
     - skills
 
+# Preserva o comportamento de reset de sessão do 0.18.0: upstream mudou o default
+# de "both" (reset diário 4h + 24h idle) para "none" na v2026.7.7 (0.18.1). Sem esta
+# seção explícita, o bump faria as sessões do gateway nunca mais auto-resetarem.
+session_reset:
+  mode: "both"
+  at_hour: 4
+  idle_minutes: 1440
+
 agent:
   max_iterations: 50
   reasoning_effort: "medium"
