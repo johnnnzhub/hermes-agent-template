@@ -83,6 +83,11 @@ COPY hostproxy.py /app/hostproxy.py
 COPY hermes-boot.sh /app/hermes-boot.sh
 RUN chmod +x /app/hermes-boot.sh
 
+# tailscale-checksums.txt: pin de supply chain. O hermes-boot.sh verifica o tarball
+# SO contra esta tabela -- o .sha256 do proprio pkgs.tailscale.com nao e consultado
+# em runtime (baixar tarball e hash do mesmo servidor e TOFU, nao pin).
+COPY tailscale-checksums.txt /app/tailscale-checksums.txt
+
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes
 
