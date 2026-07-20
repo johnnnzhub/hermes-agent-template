@@ -88,6 +88,11 @@ RUN chmod +x /app/hermes-boot.sh
 # em runtime (baixar tarball e hash do mesmo servidor e TOFU, nao pin).
 COPY tailscale-checksums.txt /app/tailscale-checksums.txt
 
+# scripts/: utilitarios operacionais. Ficam na imagem apenas para poderem ser
+# copiados para HERMES_HOME/scripts/ na ativacao -- estar aqui NAO agenda nada.
+# Sem este COPY, o `cp` do runbook do monitor nao teria origem dentro do container.
+COPY scripts/ /app/scripts/
+
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes
 

@@ -81,9 +81,22 @@ railway ssh --service Iris -- tailscale --socket=/var/run/tailscale/tailscaled.s
 curl -su "$ADMIN" https://hermes-production-bfba.up.railway.app/setup/api/status | jq .gateway
 ```
 
-Se a 4 mostrar entrada órfã de `hermes-g2`, limpar dentro do container:
-`tailscale --socket=... serve reset` e deixar o boot republicar (ou republicar à
-mão apontando para `http://127.0.0.1:9200`).
+Se a 4 mostrar entrada órfã de `hermes-g2`, limpar e **republicar na mesma
+sessão**. O `serve reset` derruba a publicação inteira, e nada reexecuta o
+`hermes-boot.sh` num container em pé — esperar que "o boot republique" deixaria a
+Iris fora do ar até o próximo restart:
+
+```
+TS="tailscale --socket=/var/run/tailscale/tailscaled.sock"
+env -u PORT $TS serve reset
+env -u PORT $TS serve --bg --https=443 http://127.0.0.1:9200
+env -u PORT $TS serve status     # tem que listar hermes-iris...:443 -> 127.0.0.1:9200
+env -u PORT $TS funnel status    # tem que continuar vazio
+curl -s -o /dev/null -w '%{http_code}\n' https://hermes-iris.tail390702.ts.net/
+```
+
+O `env -u PORT` não é opcional: `PORT=8080` do Railway quebra o TLS do Tailscale, e
+é a mesma razão pela qual toda invocação no `hermes-boot.sh` o usa.
 
 Sobre a 5: há incidente de 2026-07-16 em que o gateway não voltou sozinho após
 restart, ~35 min até um `POST /setup/api/gateway/start` manual. O commit `e2eab53`

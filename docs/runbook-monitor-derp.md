@@ -1,51 +1,86 @@
-# Runbook — ativação do monitor de perda DERP
+# Runbook — ativação do monitor de saturação da fila DERP
 
-Estado: **não ativado.** O `scripts/derp-loss.py` é versionado no repo mas não está
-instalado em `HERMES_HOME/scripts/` nem registrado no cron. Este runbook é o gate
-de ativação, separado do PR.
+Estado: **não ativado.** O `scripts/derp-loss.py` é versionado e vai na imagem
+(`/app/scripts/`), mas não está em `HERMES_HOME/scripts/` nem registrado no cron.
+Este runbook é o gate de ativação, separado do PR.
 
-## Por que existe
+## O que isto mede, e o que não mede
 
-Os contadores do relay DERP mostravam ~1,06% de descarte acumulado (385.193 de
-36.506.064) com 209 episódios de saturação de fila. Mas a razão acumulada desde o
-boot não diz se a coisa está piorando — ela é ~1% por construção e pareceria
-alarmante para sempre. O que interessa é crescimento, e é isso que o monitor mede.
+`magicsock_send_derp_dropped` / `_queued` / `_error_queue` contam **eviction e
+saturação da fila de escrita DERP deste nó**. Isso não é perda fim-a-fim: pacote
+descartado aqui nunca entrou na rede, e pacote perdido no meio do caminho não
+aparece aqui. Tratar a razão como "perda do link" superestima em repouso e
+subestima quando o problema é do outro lado.
+
+Para perda fim-a-fim, o instrumento é outro: payload byte-exato e WebSocket, em
+`docs/runbook-canary-derp-mtu.md`.
 
 ## Pré-requisitos
 
-1. Rodar **dentro do container**. Existe `hermes` também no Mac (`~/.hermes/`);
+1. **Rodar dentro do container.** Existe `hermes` também no Mac (`~/.hermes/`);
    registrado ali, o job monitora o `tailscaled` do Mac, grava estado no Mac, e
    você fica com um monitor verde que não olha para nada.
-   Confirmar: `hermes cron list` e `HERMES_HOME` apontando para `/data/.hermes`.
-2. Confirmar o subcomando de métricas no binário do container:
-   `tailscale --socket=/var/run/tailscale/tailscaled.sock debug metrics | grep magicsock_send_derp`
-   Deve devolver `magicsock_send_derp_queued` e `magicsock_send_derp_dropped`.
+   Confirmar: `echo "$HERMES_HOME"` → `/data/.hermes`.
+2. Confirmar os contadores no binário do container:
+   ```
+   tailscale --socket=/var/run/tailscale/tailscaled.sock debug metrics \
+     | grep -E 'magicsock_send_derp_(queued|dropped|error_queue)'
+   ```
    **Não** usar `tailscale metrics print`: ele não expõe esses contadores, e o que
    ele expõe (`tailscaled_outbound_dropped_packets_total`) mede drop de tstun por
    protocolo/multicast — um monitor lendo dali nunca dispara.
-3. Estado em volume persistente. O default é `$HERMES_HOME/state/`; `/tmp` some no
+3. Estado em volume persistente (default `$HERMES_HOME/state/`). `/tmp` some no
    restart e inutilizaria o histórico.
 
 ## Fase 0 — observe-only, 7 dias (obrigatória)
 
-`DERP_OBSERVE_ONLY=1` é o **default do script**. Nessa fase ele acumula
-`derp-loss.jsonl` e nunca imprime nada.
-
-Isso não é cerimônia: o limiar agudo de 3% é chute informado. Os drops vêm em
-rajada (~1.843 por episódio, ~6 episódios/dia), então uma janela de 15 min que
-contenha um episódio normal marca 1–4% legitimamente. Sem uma distribuição real,
-o número seria ajustado por incômodo nas duas primeiras semanas.
-
-Instalar e agendar em observe-only:
+Ativar o modo pelo **arquivo marcador**, não por env var: o marcador não depende
+do ambiente do serviço nem de restart, e fica visível no volume.
 
 ```
-cp scripts/derp-loss.py $HERMES_HOME/scripts/derp-loss.py
+mkdir -p "$HERMES_HOME/scripts" "$HERMES_HOME/state"
+cp /app/scripts/derp-loss.py "$HERMES_HOME/scripts/derp-loss.py"
+touch "$HERMES_HOME/state/derp-loss.observe-only"
+```
+
+Antes de criar o job, **verificar se já existe** — `create` não é idempotente e
+registrá-lo duas vezes deixa dois jobs concorrentes:
+
+```
+hermes cron list | grep -i derp-loss
+```
+
+Se não existir:
+
+```
 hermes cron create "*/15 * * * *" --name derp-loss-monitor --no-agent \
-  --script derp-loss.py
+  --script derp-loss.py --deliver "<plataforma>:<chat_id do grupo Briefing>"
+```
+
+Se já existir, **editar pelo id**, nunca recriar:
+
+```
+hermes cron edit <job_id> --schedule "*/15 * * * *" --deliver "<plataforma>:<chat_id>"
 ```
 
 O scheduler escolhe o interpretador pela **extensão** (`.sh`/`.bash` → bash, resto
 → Python), ignorando o shebang. Manter o `.py`.
+
+### Sobre o `--deliver`
+
+`--deliver` aceita `origin`, `local`, `telegram`, `discord`, `signal` ou
+`platform:chat_id`. A entrega tem que ser **apenas o grupo Briefing**, pelo
+gateway já configurado — nenhum token novo entra no repo.
+
+O `chat_id` do Briefing **não está fixado aqui de propósito**: resolvê-lo exige ler
+a configuração viva no container, e escrever um literal adivinhado seria pior que
+deixar o passo explícito. Resolver antes de criar o job e conferir com um
+`hermes cron run <job_id>` de teste (seção de verificação).
+
+Durante a fase 0 o job é silencioso por construção, então o `--deliver` fica
+apenas configurado, sem tráfego.
+
+### Fim da fase 0
 
 Depois de 7 dias, calcular o p95 da razão de janela sobre o `.jsonl` e fixar:
 
@@ -53,54 +88,79 @@ Depois de 7 dias, calcular o p95 da razão de janela sobre o `.jsonl` e fixar:
 DERP_ACUTE_RATIO = max(0.03, 2 × p95(ratio))
 ```
 
+Os 3% do default são chute informado até existir essa distribuição. Os descartes
+vêm em rajada, então uma janela de 15 min que contenha um episódio normal marca
+1–4% legitimamente; sem dado real o limiar seria ajustado por incômodo.
+
 ## Ativação dos alertas
 
-Só depois da fase 0. Setar `DERP_OBSERVE_ONLY=0` e re-registrar o job com entrega.
+```
+rm "$HERMES_HOME/state/derp-loss.observe-only"
+```
 
-Entrega: **apenas o grupo Briefing, pelo gateway Hermes já existente.** Nenhum
-token cru novo entra no repositório — usar o canal já configurado no serviço.
-Confirmar o identificador do canal no container antes de registrar; não assumir.
+Sair do observe-only muda o **fingerprint de configuração**, e o monitor zera
+sozinho o estado de alerta acumulado na primeira execução seguinte (silenciosa,
+registrada como `config-mudou` no histórico). Isso é intencional: contadores de
+janela acumulados sob outra configuração não valem para a nova.
 
-O cron `--no-agent --script` trata **stdout vazio como run silencioso**, então o
-script só produz entrega quando há problema. Zero ruído por construção. Exit code
-diferente de zero é entregue como erro pelo próprio scheduler.
+Trocar qualquer limiar tem o mesmo efeito.
 
 ## Critério implementado
 
 | Guarda | Comportamento |
 |---|---|
 | Primeira execução | grava baseline, silencioso |
-| Restart do `tailscaled` (`pid:starttime`) ou contador que diminuiu | **nova baseline**, silencioso — contador zerado nunca vira alerta |
+| Restart do `tailscaled` (`pid:starttime`) ou contador que diminuiu | **nova baseline**, silencioso |
+| Gap de coleta maior que 3× a janela | **nova baseline** (`gap-de-coleta`) — delta acumulado num intervalo muito maior que a janela não é uma taxa de janela |
+| Execução dentro do piso de janela (< 1/3 da janela desde a anterior) | sai sem gravar — evita janelas espúrias de delta zero que diluiriam a razão e inflariam a cobertura |
+| Mudança de configuração | reset silencioso (`config-mudou`) |
+| Estado ilegível | **falha fechada**: não sobrescreve, sai com código ≠ 0 e explica no stderr |
+| Outra execução em curso | sai silenciosa (lock exclusivo sobre o ciclo inteiro) |
 
 | Braço | Condição |
 |---|---|
-| Agudo | `Δqueued ≥ 20.000` **e** `Δdropped ≥ 500` **e** razão ≥ 3%, em **duas janelas consecutivas**. Histerese: rearma só após uma janela < 1,5% |
-| Crônico | razão de 24 h ≥ 2 × razão dos 7 dias anteriores, com razão de 24 h ≥ 0,5% e volume ≥ 2.000.000 |
-
-A exigência de duas janelas é o núcleo: rajada é transiente, degradação é
-persistente, e só a persistência distingue as duas.
+| Agudo | `Δqueued ≥ 20.000` **e** `Δdropped ≥ 500` **e** razão ≥ 3%, em **duas janelas consecutivas**. Histerese: rearma só após uma janela **com tráfego** e razão < 1,5% — janela ociosa não rearma |
+| Crônico | razão de 24 h ≥ 2× a dos 7 dias anteriores, com cobertura temporal mínima em cada balde. **Latch + cooldown de 24 h**: não repete a cada execução enquanto a condição persistir. Baseline histórica com zero descartes é tratada à parte (comparação por fator seria divisão por zero) |
 
 Todos os limiares são env vars (`DERP_ACUTE_RATIO`, `DERP_MIN_QUEUED`,
-`DERP_MIN_DROPPED`, `DERP_REARM_RATIO`, `DERP_CHRONIC_*`) — ajuste sem mudança de
-código.
+`DERP_MIN_DROPPED`, `DERP_REARM_RATIO`, `DERP_WINDOW_SECONDS`,
+`DERP_MIN_SPAN_SECONDS`, `DERP_MAX_SPAN_FACTOR`, `DERP_CHRONIC_*`).
 
 ## Verificação pós-ativação
 
-1. `hermes cron list` mostra o job e o `HERMES_HOME` correto.
-2. Após ~30 min, `derp-loss.jsonl` tem 2 linhas com `dq`/`dd` plausíveis.
-3. Run manual com stdout vazio: `python3 $HERMES_HOME/scripts/derp-loss.py; echo "exit=$?"`
+1. `hermes cron list` mostra **um** job `derp-loss-monitor` (não dois).
+2. Run manual silencioso:
+   ```
+   python3 "$HERMES_HOME/scripts/derp-loss.py"; echo "exit=$?"
+   ```
    → sem saída, `exit=0`.
-4. Testar o caminho de alerta sem esperar degradação: rodar com
-   `DERP_ACUTE_RATIO=0` e `DERP_MIN_QUEUED=0` num `DERP_STATE_DIR` **temporário**
-   por duas execuções e confirmar que a mensagem chega ao Briefing. Nunca apontar
-   o teste para o state dir real — contaminaria a baseline.
+3. Após ~30 min, `derp-loss.jsonl` tem 2 linhas com `dq`/`dd` plausíveis.
+4. **Testar o caminho de entrega sem esperar degradação**, num `DERP_STATE_DIR`
+   temporário — nunca no state real, que contaminaria a baseline:
+   ```
+   T=$(mktemp -d)
+   for i in 1 2 3; do
+     DERP_STATE_DIR="$T" DERP_OBSERVE_ONLY=0 DERP_MIN_SPAN_SECONDS=0 \
+     DERP_ACUTE_RATIO=0 DERP_MIN_QUEUED=0 DERP_MIN_DROPPED=0 \
+       python3 "$HERMES_HOME/scripts/derp-loss.py"
+   done
+   rm -rf "$T"
+   ```
+   Confirmar que a mensagem chegou ao Briefing e a nenhum outro canal.
 
 ## Rollback
 
-`hermes cron delete derp-loss-monitor` no container. O script e o estado são
-inertes sem o job. Remover `$HERMES_HOME/scripts/derp-loss.py` é opcional.
+```
+hermes cron list                 # pegar o job_id
+hermes cron remove <job_id>      # remove exige o ID, nao o nome amigavel
+```
+
+O script e o estado ficam inertes sem o job. Remover
+`$HERMES_HOME/scripts/derp-loss.py` é opcional.
 
 ## Testes
 
-`python3 tests/test_derp_loss.py` — 28 asserts em 13 cenários, com fixtures
-sintéticas. Não toca rede, socket do tailscaled nem produção.
+`python3 tests/test_derp_loss.py` — 56 asserts em 21 cenários, com fixtures
+sintéticas. Cobre latch do crônico, exclusão mútua, falha fechada em estado
+corrompido, janela ociosa que não rearma, gap de coleta e reset por configuração.
+Não toca rede, socket do tailscaled nem produção.
