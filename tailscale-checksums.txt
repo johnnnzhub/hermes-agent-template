@@ -1,0 +1,33 @@
+# tailscale-checksums.txt — pin de supply chain do Tailscale usado pelo hermes-boot.sh
+#
+# POR QUE ESTE ARQUIVO EXISTE
+# Baixar o tarball e o .sha256 do MESMO servidor nao e um pin: e trust-on-first-use.
+# Quem controlar (ou envenenar o caminho ate) pkgs.tailscale.com serve os dois
+# coerentes entre si e a verificacao passa. O hash tem que ser controlado AQUI, no
+# repositorio, revisado no PR e alterado so por commit. Em runtime o hermes-boot.sh
+# consulta SOMENTE esta tabela; o sidecar remoto nao e mais fonte de verdade.
+#
+# REGRA: versao/arquitetura ausente desta tabela NAO e instalada. O boot mantem o
+# binario anterior e segue. Nunca ha fallback silencioso para outra arquitetura.
+#
+# COMO ADICIONAR UMA VERSAO
+#   1. curl -fsSL https://pkgs.tailscale.com/stable/tailscale_<ver>_<arch>.tgz.sha256
+#   2. Conferir o valor por um segundo caminho independente (outra rede/maquina, ou
+#      baixar o tarball e rodar sha256sum localmente).
+#   3. Acrescentar a linha abaixo e registrar a procedencia neste cabecalho.
+#
+# PROCEDENCIA DOS VALORES ABAIXO (2026-07-19)
+#   1.98.9 amd64 — TRES coletas independentes concordantes: verificacao da Iris,
+#                  mais duas coletas separadas a partir do sidecar oficial.
+#                  Esta e a arquitetura que roda em producao (Railway = amd64).
+#
+# ARM64 DELIBERADAMENTE AUSENTE. Houve uma coleta do sidecar oficial, mas sem
+# validacao independente real -- e um hash de uma so fonte nao e pin, e o mesmo
+# raciocinio que tira o sidecar do runtime tira esse valor daqui. Enquanto nao
+# houver segunda validacao, arm64 cai no fail-safe: nao instala, mantem o binario
+# anterior e loga. Nenhum ambiente atual usa arm64.
+#
+# Formato: <versao> <arch> <sha256 do tarball .tgz>
+# Comentarios comecam com # e linhas em branco sao ignoradas.
+
+1.98.9  amd64  11be30ad301d48f84ff52fec34f8a2f78eb3e3dee1be4e9624d19fccc8df5540

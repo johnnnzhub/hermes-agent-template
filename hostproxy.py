@@ -36,49 +36,77 @@ HOP = {
 
 
 def _forward_headers(headers):
-    # Remove hop-by-hop + Host. Omitir o Host faz o aiohttp definir o Host do
-    # destino (127.0.0.1:9119), que e o que o dashboard aceita — esse e o
-    # host-rewrite. Mantem cookie/authorization/etc.
-    return {k: v for k, v in headers.items()
-            if k.lower() not in HOP and k.lower() != "host"}
+    # Remove hop-by-hop + Host (aiohttp define o Host do destino loopback = o
+    # host-rewrite). Reescreve Origin -> loopback: o dashboard valida o Origin
+    # no WS (/api/ws) e rejeita Origin != loopback com 403 (anti-DNS-rebinding),
+    # entao o Origin do cliente (https://hermes-g2...) precisa ser reescrito.
+    # Mantem cookie/authorization/X-Hermes-Session-Token/etc.
+    out = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl in HOP or kl == "host":
+            continue
+        if kl == "origin":
+            out[k] = f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}"
+        else:
+            out[k] = v
+    return out
 
 
 async def _proxy_ws(request):
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
     target = f"{UPSTREAM_WS}{request.rel_url.raw_path_qs}"
     # Tira os headers de handshake que o aiohttp regenera no ws_connect.
     hdrs = {k: v for k, v in _forward_headers(request.headers).items()
             if not k.lower().startswith("sec-websocket")}
     session = aiohttp.ClientSession()
+    # 1) Conecta ao upstream ANTES de completar o upgrade com o cliente. Se o
+    #    upstream rejeitar (403 Origin/Host, 401/403 token), refletimos o MESMO
+    #    status em vez de um 101 falso seguido de close (que o cliente le como
+    #    timeout/sessao recusada).
     try:
-        async with session.ws_connect(target, headers=hdrs, max_msg_size=0,
-                                      autoping=True, heartbeat=None) as up:
-            async def pump(src, dst):
-                async for msg in src:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        await dst.send_str(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.BINARY:
-                        await dst.send_bytes(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.PING:
-                        await dst.ping(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.PONG:
-                        await dst.pong(msg.data)
-                    else:  # CLOSE / CLOSING / CLOSED / ERROR
-                        break
-
-            t1 = asyncio.create_task(pump(up, ws_server))
-            t2 = asyncio.create_task(pump(ws_server, up))
-            done, pending = await asyncio.wait(
-                {t1, t2}, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-    except Exception as e:
-        print(f"[hostproxy] ws error {request.path}: {e!r}", flush=True)
-    finally:
+        up = await session.ws_connect(target, headers=hdrs, max_msg_size=0,
+                                      autoping=True, heartbeat=None)
+    except aiohttp.WSServerHandshakeError as e:
         await session.close()
-        if not ws_server.closed:
-            await ws_server.close()
+        return web.Response(status=e.status, text="hostproxy: upstream ws handshake rejected")
+    except Exception as e:
+        await session.close()
+        print(f"[hostproxy] ws connect error {request.path}: {e!r}", flush=True)
+        return web.Response(status=502, text="hostproxy: upstream ws unavailable")
+    # 2) Upstream aceitou -> completa o upgrade com o cliente (espelha o
+    #    subprotocolo, se houver) e faz o pump bidirecional. O pump e criado
+    #    logo apos o prepare, sem janela para frames do cliente se perderem.
+    proto = up.protocol or None
+    ws_server = web.WebSocketResponse(protocols=(proto,) if proto else ())
+    await ws_server.prepare(request)
+
+    async def pump(src, dst):
+        async for msg in src:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                await dst.send_str(msg.data)
+            elif msg.type == aiohttp.WSMsgType.BINARY:
+                await dst.send_bytes(msg.data)
+            elif msg.type == aiohttp.WSMsgType.PING:
+                await dst.ping(msg.data)
+            elif msg.type == aiohttp.WSMsgType.PONG:
+                await dst.pong(msg.data)
+            else:  # CLOSE / CLOSING / CLOSED / ERROR
+                break
+
+    try:
+        t1 = asyncio.create_task(pump(up, ws_server))
+        t2 = asyncio.create_task(pump(ws_server, up))
+        done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+    except Exception as e:
+        print(f"[hostproxy] ws pump error {request.path}: {e!r}", flush=True)
+    finally:
+        try:
+            await up.close()
+        except Exception:
+            pass
+        await session.close()
     return ws_server
 
 

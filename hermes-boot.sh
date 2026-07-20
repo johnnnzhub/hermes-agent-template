@@ -8,7 +8,12 @@
 # Startup chain: railway.toml startCommand=/app/hermes-boot.sh
 #   -> sobe tailscaled+serve em BACKGROUND -> exec /app/start.sh
 # Vars (Railway service, NUNCA no repo): TS_AUTHKEY (reusavel), TS_HOSTNAME (default hermes-g2).
+# Vars opcionais de instalacao: TS_VERSION (pin, default 1.98.9), TS_SKIP_UPGRADE=1
+#   (freio de emergencia sem mudanca de codigo), TS_PKGS_BASE, TS_CHECKSUMS_FILE,
+#   TS_BIN_ROOT (as tres ultimas existem para os testes poderem redirecionar).
 # Pegadinha: env PORT=8080 do Railway quebra o TLS do Tailscale -> env -u PORT sempre.
+# Pegadinha: `set -u` SEM `-e` e proposital. Com `-e`, um curl falho mataria o boot;
+#   todo o fail-safe da instalacao depende de falha nao ser fatal.
 set -u
 DRY_RUN="${DRY_RUN:-0}"
 TS_STATE_DIR="${TS_STATE_DIR:-/data/.tailscale}"
@@ -18,26 +23,243 @@ TS_HOSTNAME="${TS_HOSTNAME:-hermes-g2}"
 TS_FQDN="${TS_HOSTNAME}.${TS_TAILNET}"
 DASH_PORT="${DASH_PORT:-9119}"   # dashboard LOCAL existente (server.py spawna)
 PROXY_PORT="${HOSTPROXY_PORT:-9200}"   # hostproxy loopback (Host-rewrite) -> dashboard
-export PATH="/data/bin:$PATH"
+# Versao pinada + checksums controlados no repo (ver tailscale-checksums.txt).
+# O pin e REPRODUTIBILIDADE e ROLLBACK -- nao e correcao comprovada da perda no DERP.
+TS_VERSION="${TS_VERSION:-1.98.9}"; TS_VERSION="${TS_VERSION#v}"
+TS_PKGS_BASE="${TS_PKGS_BASE:-https://pkgs.tailscale.com/stable}"
+TS_CHECKSUMS_FILE="${TS_CHECKSUMS_FILE:-/app/tailscale-checksums.txt}"
+TS_BIN_ROOT="${TS_BIN_ROOT:-/data/bin/ts}"
+# ts/current PRIMEIRO: e o ponteiro trocado atomicamente pelo ts_install. Se ele
+# faltar ou estiver pendurado, o `command -v` cai para /data/bin (binarios antigos)
+# em vez de ficar sem tailscale -- o estado anterior vira fallback, nao ponto de falha.
+export PATH="$TS_BIN_ROOT/current:/data/bin:$PATH"
 
 log(){ echo "[hermes-boot-v3] $*"; }
 ts(){ env -u PORT tailscale --socket="$TS_SOCK" "$@"; }
 running(){ ts status >/dev/null 2>&1; }
 
+# ---------------------------------------------------------------------------
+# Instalacao do Tailscale: pin + checksum do repo + troca atomica de ponteiro.
+#
+# O gate e por VERSAO, nao por presenca. O gate antigo (`command -v X || [ -x X ]`)
+# dava true para binario truncado por download interrompido -- que ficava instalado
+# no volume persistente PARA SEMPRE, sem caminho de upgrade nem de recuperacao.
+#
+# Layout:
+#   $TS_BIN_ROOT/<versao>/{tailscaled,tailscale}   dir versionado, self-testado
+#   $TS_BIN_ROOT/current -> <versao>               UNICO ponteiro, trocado por rename(2)
+#
+# Uma troca => nunca existe instante com tailscale e tailscaled em versoes diferentes.
+# QUALQUER falha em QUALQUER etapa mantem o binario anterior e o boot segue.
+# ---------------------------------------------------------------------------
+
+# Versao lida do PROPRIO binario. Nunca de stamp file: stamp mente se o binario
+# corromper depois. Falha de exec (truncado/arch errada) devolve vazio -> tratado
+# como "precisa reinstalar", nunca aborta o boot.
+ts_ver(){
+  local b; b="$(command -v "$1" 2>/dev/null)"
+  [ -n "$b" ] && [ -x "$b" ] || return 0
+  timeout 5 "$b" --version 2>/dev/null | head -1 | tr -d '\r' \
+    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+'
+}
+
+# sha256 vem SO da tabela do repo. O sidecar remoto nao e consultado: baixar
+# tarball e hash do mesmo servidor e TOFU, nao pin de supply chain.
+ts_sum(){
+  [ -r "$TS_CHECKSUMS_FILE" ] || return 0
+  awk -v v="$1" -v a="$2" '
+    /^[[:space:]]*#/ { next }
+    $1 == v && $2 == a { print $3; exit }
+  ' "$TS_CHECKSUMS_FILE" 2>/dev/null
+}
+
+# Mantem a versao ativa + a anterior mais recente (64MB cada); poda o resto.
+# Guardar a anterior localmente e o que faz o rollback por TS_VERSION funcionar
+# SEM rede. Glob + teste `-nt` em vez de parsear `ls` (SC2045).
+ts_gc(){
+  local keep="$1" d b newest=""
+  # ATENCAO: o glob */ (com barra) SEGUE symlinks-para-diretorio, entao `current`
+  # entra na lista. Sem o filtro -L abaixo o ponteiro seria eleito "mais recente"
+  # (aponta pra versao que acabou de ser instalada), a versao anterior REAL seria
+  # podada no lugar dele, e um rm -rf em "current/" apagaria o conteudo da versao
+  # ATIVA atraves do symlink. Pego pelo tests/test_boot_install.sh (T10/T11).
+  for d in "$TS_BIN_ROOT"/*/; do
+    [ -d "$d" ] || continue                      # glob sem match vem literal
+    [ -L "${d%/}" ] && continue                  # ponteiro `current`, nao e versao
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac
+    [ "$b" = "$keep" ] && continue
+    if [ -z "$newest" ] || [ "$d" -nt "$newest" ]; then newest="$d"; fi
+  done
+  for d in "$TS_BIN_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    [ -L "${d%/}" ] && continue
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac
+    [ "$b" = "$keep" ] && continue
+    [ "$d" = "$newest" ] && continue
+    rm -rf "$d" 2>/dev/null || true
+  done
+}
+
+# Troca ATOMICA do ponteiro: symlink novo ao lado, renomeado por cima do atual.
+# -T (GNU) / -h (BSD) impedem que o mv entre no diretorio apontado pelo symlink
+# existente. A flag nao suportada falha ANTES de tocar em qualquer coisa, entao
+# o `||` escolhe a implementacao certa sem risco de acao parcial.
+ts_point_to(){
+  local ver="$1"
+  ln -sfn "$ver" "$TS_BIN_ROOT/.current.new" 2>/dev/null || return 1
+  if mv -Tf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null \
+     || mv -hf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$TS_BIN_ROOT/.current.new" 2>/dev/null || true
+  return 1
+}
+
+# Promove uma versao JA CACHEADA em $TS_BIN_ROOT/<ver> SEM REDE.
+# E isto que faz o rollback por TS_VERSION funcionar offline: se o diretorio
+# existe e os dois binarios passam no self-test, so troca o ponteiro. Sem este
+# caminho, um rollback exigiria baixar de novo -- justamente o que pode nao estar
+# disponivel na hora em que se precisa dele.
+ts_promote_cached(){
+  # Dois `local` separados de proposito: num `local a=X b=$a`, o $a ainda nao
+  # esta atribuido e sob `set -u` isso e unbound variable FATAL (SC2318).
+  local ver="$1"
+  local dir="$TS_BIN_ROOT/$ver" vd vc
+  [ -d "$dir" ] || return 1
+  vd="$(timeout 5 "$dir/tailscaled" --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  vc="$(timeout 5 "$dir/tailscale"  --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  if [ "$vd" != "$ver" ] || [ "$vc" != "$ver" ]; then
+    log "ts: cache de $ver reprovou no self-test (d=${vd:-none} c=${vc:-none})"; return 1
+  fi
+  ts_point_to "$ver" || { log "ts: troca do ponteiro falhou ($ver, cache)"; return 1; }
+  log "ts: $ver promovido do cache local (sem rede)"
+  ts_gc "$ver"
+  return 0
+}
+
+ts_install(){
+  local ver="$1" arch="$2" want stage tgz got vd vc dest
+  want="$(ts_sum "$ver" "$arch")"
+  if [ "${#want}" -ne 64 ] || [ -n "$(printf '%s' "$want" | tr -d '0-9a-f')" ]; then
+    log "ts: sem checksum no repo para $ver/$arch -> NAO instala"; return 1
+  fi
+  mkdir -p "$TS_BIN_ROOT" 2>/dev/null || { log "ts: mkdir $TS_BIN_ROOT falhou"; return 1; }
+  rm -rf "$TS_BIN_ROOT"/.stage.* 2>/dev/null || true   # sobra de boot que crashou
+  # stage no MESMO filesystem do destino: mv entre filesystems degrada para
+  # copy+unlink e deixa de ser atomico.
+  stage="$(mktemp -d "$TS_BIN_ROOT/.stage.XXXXXX" 2>/dev/null)" \
+    || { log "ts: mktemp em $TS_BIN_ROOT falhou"; return 1; }
+  tgz="$stage/ts.tgz"
+  curl -fsSL -m 180 -o "$tgz" "$TS_PKGS_BASE/tailscale_${ver}_${arch}.tgz" 2>/dev/null \
+    || { log "ts: download falhou ($ver/$arch)"; rm -rf "$stage"; return 1; }
+  got="$(sha256sum "$tgz" 2>/dev/null | awk '{print $1}')"
+  if [ "$got" != "$want" ]; then
+    log "ts: CHECKSUM MISMATCH $ver/$arch (repo=$want baixado=${got:-vazio})"
+    rm -rf "$stage"; return 1
+  fi
+  # extrai por nome de membro explicito (o glob antigo /tmp/tailscale_*_$A casava
+  # sobras de extracoes anteriores)
+  tar -xzf "$tgz" -C "$stage" --strip-components=1 \
+      "tailscale_${ver}_${arch}/tailscaled" "tailscale_${ver}_${arch}/tailscale" 2>/dev/null \
+    || { log "ts: tar falhou ($ver/$arch)"; rm -rf "$stage"; return 1; }
+  rm -f "$tgz" 2>/dev/null || true
+  chmod 0755 "$stage/tailscaled" "$stage/tailscale" 2>/dev/null || true
+  # self-test ANTES de promover: pega extracao truncada, disco cheio e arch errada
+  vd="$(timeout 5 "$stage/tailscaled" --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  vc="$(timeout 5 "$stage/tailscale"  --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  if [ "$vd" != "$ver" ] || [ "$vc" != "$ver" ]; then
+    log "ts: self-test reprovou ($ver): d=${vd:-none} c=${vc:-none}"; rm -rf "$stage"; return 1
+  fi
+  dest="$TS_BIN_ROOT/$ver"
+  incoming="$TS_BIN_ROOT/.incoming.$ver.$$"
+  quarantine="$TS_BIN_ROOT/.quarantine.$ver.$$"
+  mv -f "$stage" "$incoming" 2>/dev/null \
+    || { log "ts: stage->incoming falhou ($ver)"; rm -rf "$stage"; return 1; }
+  # NUNCA apagar o destino antes de a nova versao estar pronta. A versao anterior
+  # deste bloco fazia `rm -rf "$dest"` e so depois o `mv`: com o binario ativo
+  # corrompido, o gate reinstala a MESMA versao para onde `current` aponta, o rm
+  # apagava esse dir e um mv falho deixava o ponteiro PENDURADO -- com o log
+  # dizendo "segue com o binario anterior" sem existir binario nenhum.
+  if [ -e "$dest" ]; then
+    mv -f "$dest" "$quarantine" 2>/dev/null \
+      || { log "ts: nao consegui isolar o destino anterior ($ver)"; rm -rf "$incoming"; return 1; }
+  fi
+  if ! mv -f "$incoming" "$dest" 2>/dev/null; then
+    log "ts: promocao falhou ($ver) -> restaurando o destino anterior"
+    [ -e "$quarantine" ] && mv -f "$quarantine" "$dest" 2>/dev/null
+    rm -rf "$incoming" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "$quarantine" 2>/dev/null || true
+  ts_point_to "$ver" || { log "ts: troca do ponteiro falhou ($ver) -> mantem o anterior"; return 1; }
+  log "ts: $ver ativo ($arch)"
+  ts_gc "$ver"
+  return 0
+}
+
+# Ultima linha de defesa: se `current` ficou pendurado (aponta para dir
+# inexistente), o PATH nao resolve e qualquer log de fail-safe seria mentira.
+# Tenta apontar para alguma versao cacheada que passe no self-test; nao havendo
+# nenhuma, REMOVE o ponteiro para o PATH cair em /data/bin, e diz isso alto.
+ts_repair_pointer(){
+  [ -L "$TS_BIN_ROOT/current" ] || return 0
+  [ -d "$TS_BIN_ROOT/current" ] && return 0     # resolve -> nada a reparar
+  local d b
+  for d in "$TS_BIN_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    [ -L "${d%/}" ] && continue
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac
+    if ts_promote_cached "$b"; then
+      log "ts: ponteiro pendurado reparado -> $b"
+      return 0
+    fi
+  done
+  rm -f "$TS_BIN_ROOT/current" 2>/dev/null || true
+  log "ts: ATENCAO ponteiro pendurado e nenhuma versao cacheada valida -> ponteiro removido, PATH cai em /data/bin"
+  return 1
+}
+
+ts_ensure(){
+  local A have_d have_c
+  case "$(uname -m)" in
+    x86_64)        A=amd64;;
+    aarch64|arm64) A=arm64;;
+    # arch desconhecida NUNCA cai em amd64: instalar binario de outra arquitetura
+    # deixaria o no sem tailscale sem nenhum sinal ate o daemon falhar no exec.
+    *)             A="";;
+  esac
+  have_d="$(ts_ver tailscaled)"; have_c="$(ts_ver tailscale)"
+  if [ "${TS_SKIP_UPGRADE:-0}" = "1" ]; then
+    log "ts: TS_SKIP_UPGRADE=1 -> mantem d=${have_d:-none} c=${have_c:-none}"
+  elif [ -z "$A" ]; then
+    log "ts: arch $(uname -m) nao suportada -> mantem d=${have_d:-none} c=${have_c:-none}"
+  elif [ "$have_d" = "$TS_VERSION" ] && [ "$have_c" = "$TS_VERSION" ]; then
+    log "ts: $TS_VERSION ja ativo ($A)"
+  else
+    log "ts: instalado d=${have_d:-none} c=${have_c:-none} -> desejado $TS_VERSION ($A)"
+    # Cache local ANTES da rede: rollback por TS_VERSION tem que funcionar offline.
+    ts_promote_cached "$TS_VERSION" \
+      || ts_install "$TS_VERSION" "$A" \
+      || log "ts: troca de versao falhou -> SEGUE com o binario anterior (fail-safe)"
+  fi
+  # so afirmamos fail-safe depois de conferir que ainda ha binario resolvivel
+  ts_repair_pointer || true
+}
+
 mkdir -p "$TS_STATE_DIR" /var/run/tailscale /data/bin 2>/dev/null || true
 
 tailscale_up_serve(){
-  # 0) binarios (cacheia no volume; a imagem nao traz tailscale). O script usa AMBOS
-  #    tailscaled (daemon) e tailscale (cliente) -> baixa/reinstala se QUALQUER um faltar.
-  have(){ command -v "$1" >/dev/null 2>&1 || [ -x "/data/bin/$1" ]; }
-  if ! have tailscaled || ! have tailscale; then
-    case "$(uname -m)" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; *) A=amd64;; esac
-    P="$(curl -fsSL https://pkgs.tailscale.com/stable/ 2>/dev/null | grep -oE "tailscale_[0-9.]+_${A}\.tgz" | head -1)"
-    [ -n "$P" ] && curl -fsSL -o /tmp/ts.tgz "https://pkgs.tailscale.com/stable/$P" \
-      && tar -xzf /tmp/ts.tgz -C /tmp \
-      && cp -a /tmp/tailscale_*_${A}/tailscaled /tmp/tailscale_*_${A}/tailscale /data/bin/ \
-      && log "tailscale baixado ($P)" || log "download tailscale falhou"
-  fi
+  # 0) binarios: gate por VERSAO + checksum controlado no repo + troca atomica de
+  #    ponteiro (ver ts_ensure/ts_install acima). A imagem nao traz tailscale; o
+  #    volume /data cacheia entre deploys.
+  #    NAO faz hot-swap de daemon vivo: se o tailscaled ja estiver rodando, ele
+  #    segue no inode antigo e a versao nova so e adotada no proximo restart.
+  #    Matar o daemon para adotar build novo derrubaria o no -- e se o build novo
+  #    estivesse ruim, deixaria a Iris inalcancavel.
+  ts_ensure
   TSD="$(command -v tailscaled 2>/dev/null || echo /data/bin/tailscaled)"
   # 1) tailscaled userspace, state no volume (preserva identidade/cert entre deploys)
   if ! running; then
@@ -71,6 +293,11 @@ tailscale_up_serve(){
   ts funnel status 2>/dev/null || true   # esperado: vazio
   log "tailscale serve ativo (tailnet-only) -> hostproxy 127.0.0.1:$PROXY_PORT -> dashboard 127.0.0.1:$DASH_PORT"
 }
+
+# Hook de teste: roda SO a instalacao do binario e sai. Usado pelo
+# tests/test_boot_install.sh -- nao sobe daemon, nao toca no serve, nao encadeia o
+# start.sh. Sem ele a logica de instalacao so seria exercitavel em producao.
+if [ "${TS_INSTALL_ONLY:-0}" = "1" ]; then ts_ensure; exit 0; fi
 
 if [ "$DRY_RUN" = "1" ]; then
   log "DRY_RUN: nao sobe tailscale; encadearia /app/start.sh"
