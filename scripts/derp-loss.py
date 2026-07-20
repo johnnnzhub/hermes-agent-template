@@ -93,6 +93,12 @@ CHRONIC_MIN_WINDOWS_PRIOR = int(os.environ.get("DERP_CHRONIC_MIN_WINDOWS_PRIOR",
 CHRONIC_COVERAGE = float(os.environ.get("DERP_CHRONIC_COVERAGE", "0.5"))
 CHRONIC_COOLDOWN = int(os.environ.get("DERP_CHRONIC_COOLDOWN", "86400"))
 HISTORY_MAX = int(os.environ.get("DERP_HISTORY_MAX", "5000"))
+# `dropped` conta eviction de pacote ANTIGO da fila; `error_queue` conta o pacote
+# ATUAL descartado apos as tentativas. Os dois sao descarte real, entao os dois
+# entram na decisao -- contar so o primeiro deixa passar o caso em que a fila
+# rejeita tudo que chega (dropped nao cresce, error_queue sim).
+COUNT_ERRQ = os.environ.get("DERP_COUNT_ERRQ", "1") == "1"
+DEST_FILE = STATE_DIR / "derp-loss.dest"
 
 DAY = 86400
 
@@ -107,6 +113,24 @@ def observe_only():
     return os.environ.get("DERP_OBSERVE_ONLY", "1") == "1"
 
 
+def alert_destination():
+    """Destino explícito dos alertas, ou None.
+
+    Fora do observe-only o monitor FALHA FECHADA sem destino resolvido: um alerta
+    que não sabe para onde vai é pior que nenhum, porque cria a impressão de
+    cobertura. Não há placeholder nem default -- o valor entra na ativação, depois
+    de resolvido contra o diretório de canais vivo.
+    """
+    env = os.environ.get("DERP_ALERT_DEST", "").strip()
+    if env:
+        return env
+    try:
+        v = DEST_FILE.read_text().strip()
+        return v or None
+    except OSError:
+        return None
+
+
 def config_fingerprint():
     """Muda quando um limiar ou o modo muda. Estado de alerta acumulado sob uma
     configuração não vale para outra -- ao trocar, zera contadores e latches."""
@@ -118,7 +142,7 @@ def config_fingerprint():
         "c_factor": CHRONIC_FACTOR, "c_ratio": CHRONIC_MIN_RATIO,
         "c_queued": CHRONIC_MIN_QUEUED, "c_wr": CHRONIC_MIN_WINDOWS_RECENT,
         "c_wp": CHRONIC_MIN_WINDOWS_PRIOR, "c_cov": CHRONIC_COVERAGE,
-        "c_cool": CHRONIC_COOLDOWN,
+        "c_cool": CHRONIC_COOLDOWN, "count_errq": COUNT_ERRQ,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -265,6 +289,44 @@ def baseline(now, iso, m, did, fp, reason):
     }
 
 
+def drops(entry):
+    """Descarte total de uma janela do histórico. `derrq` pode faltar em linhas
+    antigas -- ausente conta como zero, nunca como erro."""
+    d = int(entry.get("dd", 0))
+    return d + int(entry.get("derrq", 0) or 0) if COUNT_ERRQ else d
+
+
+def covered_seconds(entries, lo, hi):
+    """União temporal REAL coberta pelas amostras dentro de [lo, hi].
+
+    Contar amostras x tamanho-nominal-de-janela (`len(x) * WINDOW`) superestima:
+    ignora o span real de cada amostra e conta duas vezes qualquer sobreposição.
+    Com isso, um punhado de amostras densas passava por "12 horas de cobertura".
+    Aqui cada amostra vale o intervalo que ela de fato mediu, recortado ao balde,
+    e os intervalos são fundidos antes de somar.
+    """
+    iv = []
+    for e in entries:
+        end = int(e["epoch"])
+        start = end - int(e.get("span") or WINDOW)
+        start, end = max(start, lo), min(end, hi)
+        if end > start:
+            iv.append((start, end))
+    iv.sort()
+    total, cur_s, cur_e = 0, None, None
+    for s, en in iv:
+        if cur_e is None:
+            cur_s, cur_e = s, en
+        elif s <= cur_e:
+            cur_e = max(cur_e, en)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, en
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
 def chronic_check(now):
     """24 h contra os 7 dias anteriores, com cobertura mínima em cada balde.
 
@@ -276,13 +338,13 @@ def chronic_check(now):
     prior = [e for e in hist if now - 8 * DAY <= e["epoch"] < now - DAY]
     if len(recent) < CHRONIC_MIN_WINDOWS_RECENT or len(prior) < CHRONIC_MIN_WINDOWS_PRIOR:
         return None
-    if len(recent) * WINDOW < CHRONIC_COVERAGE * DAY:
+    if covered_seconds(recent, now - DAY, now) < CHRONIC_COVERAGE * DAY:
         return None
-    if len(prior) * WINDOW < CHRONIC_COVERAGE * 7 * DAY:
+    if covered_seconds(prior, now - 8 * DAY, now - DAY) < CHRONIC_COVERAGE * 7 * DAY:
         return None
 
-    rq, rd = sum(e["dq"] for e in recent), sum(e["dd"] for e in recent)
-    pq, pd = sum(e["dq"] for e in prior), sum(e["dd"] for e in prior)
+    rq, rd = sum(e["dq"] for e in recent), sum(drops(e) for e in recent)
+    pq, pd = sum(e["dq"] for e in prior), sum(drops(e) for e in prior)
     if rq < CHRONIC_MIN_QUEUED or pq <= 0:
         return None
     r_recent, r_prior = ratio(rd, rq), ratio(pd, pq)
@@ -367,7 +429,11 @@ def run():
     dq = m[QUEUED] - prev.get("queued", 0)
     dd = m[DROPPED] - prev.get("dropped", 0)
     derrq = m.get(ERRQ, 0) - prev.get("errq", 0)
-    r = ratio(dd, dq)
+    # descarte total: eviction de pacote antigo (dd) + pacote atual recusado pela
+    # fila cheia (derrq). Contar so o primeiro deixaria passar exatamente o caso
+    # em que a fila rejeita tudo que chega.
+    dd_total = dd + derrq if COUNT_ERRQ else dd
+    r = ratio(dd_total, dq)
     append_history({"ts": iso, "epoch": now, "dq": dq, "dd": dd, "derrq": derrq,
                     "ratio": round(r, 6), "span": span})
 
@@ -375,7 +441,7 @@ def run():
     alerting = bool(prev.get("alerting", False))
     chronic_epoch = prev.get("chronic_alert_epoch")
 
-    breach = dq >= MIN_QUEUED and dd >= MIN_DROPPED and r >= ACUTE_RATIO
+    breach = dq >= MIN_QUEUED and dd_total >= MIN_DROPPED and r >= ACUTE_RATIO
     consecutive = consecutive + 1 if breach else 0
     # Rearme exige VOLUME: janela ociosa tem dq=0 e razão 0, e limparia o latch
     # sem nenhuma evidência de que a situação melhorou.
@@ -383,14 +449,30 @@ def run():
         alerting = False
 
     alerts = []
-    if not observe_only():
+    armed = not observe_only()
+    if armed and alert_destination() is None:
+        # FALHA FECHADA: fora do observe-only sem destino resolvido, nao alerta e
+        # nao finge estar monitorando. Sai != 0 para o scheduler entregar o erro.
+        save_state({
+            "schema": SCHEMA, "ts": iso, "epoch": now,
+            "queued": m[QUEUED], "dropped": m[DROPPED], "errq": m.get(ERRQ, 0),
+            "daemon_id": did, "config_fp": fp,
+            "consecutive_breaches": consecutive, "alerting": alerting,
+            "chronic_alert_epoch": chronic_epoch,
+        })
+        print("derp-loss: fora do observe-only sem destino de alerta resolvido "
+              "(DERP_ALERT_DEST ou <state>/derp-loss.dest) -- nao alerta",
+              file=sys.stderr)
+        return 5
+
+    if armed:
         if consecutive >= 2 and not alerting:
             alerting = True
-            extra = f", {derrq} eventos de fila cheia" if derrq > 0 else ""
+            extra = f", {derrq} recusados por fila cheia" if derrq > 0 else ""
             alerts.append(
                 f"DERP: descarte sustentado na fila local. {consecutive} janelas "
-                f"consecutivas com {r * 100:.2f}% ({dd} de {dq} enfileirados na "
-                f"ultima{extra}). Mede saturacao local, nao perda fim-a-fim."
+                f"consecutivas com {r * 100:.2f}% ({dd_total} de {dq} enfileirados "
+                f"na ultima{extra}). Mede saturacao local, nao perda fim-a-fim."
             )
         chronic = chronic_check(now)
         if chronic:

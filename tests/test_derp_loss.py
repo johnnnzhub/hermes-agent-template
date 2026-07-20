@@ -78,6 +78,9 @@ class Env:
             # debounce as descartaria por virem milissegundos apos a anterior.
             # O piso real e exercitado no T18.
             "DERP_MIN_SPAN_SECONDS": "0",
+            # fora do observe-only o monitor falha fechada sem destino resolvido;
+            # os testes armados declaram um. O guard em si e coberto no T22.
+            "DERP_ALERT_DEST": "teste:canal-de-teste",
             "DERP_DAEMON_ID": daemon if daemon is not None else self.daemon,
         })
         env.update({k: str(v) for k, v in self.extra.items()})
@@ -357,6 +360,72 @@ eq("T20 le magicsock_send_derp_dropped", st["dropped"], 10_000)
 eq("T20 le magicsock_send_derp_error_queue", st["errq"], 5)
 e.run(1_100_000, 15_000, errq=9)
 eq("T20 registra delta de fila cheia", e.history()[-1]["derrq"], 4)
+e.close()
+
+# ---------------------------------------------------------------------------
+# T22 — FALHA FECHADA sem destino: fora do observe-only e sem destino resolvido,
+# nao alerta e sinaliza. Um alerta que nao sabe para onde vai e pior que nenhum,
+# porque cria impressao de cobertura.
+# ---------------------------------------------------------------------------
+e = Env()
+e.run(1_000_000, 10_000, DERP_ALERT_DEST="")
+e.run(1_100_000, 15_000, DERP_ALERT_DEST="")
+out = e.run(1_200_000, 20_000, DERP_ALERT_DEST="")
+silent("T22 sem destino nao alerta", out)
+ok("T22 sinaliza por exit code") if e.last.returncode == 5 \
+    else bad("T22 sinaliza por exit code", f"exit={e.last.returncode}")
+ok("T22 explica no stderr") if "sem destino de alerta" in e.last.stderr \
+    else bad("T22 explica no stderr", e.last.stderr.strip()[:120])
+
+# o mesmo cenario com destino declarado por ARQUIVO passa a alertar
+(e.dir / "derp-loss.dest").write_text("teste:canal-por-arquivo\n")
+speaks("T22 destino por arquivo destrava", e.run(1_300_000, 25_000, DERP_ALERT_DEST=""),
+       "descarte sustentado")
+
+# observe-only nao exige destino
+e2 = Env()
+(e2.dir / "derp-loss.observe-only").touch()
+e2.run(1_000_000, 10_000, DERP_ALERT_DEST="")
+silent("T22 observe-only nao exige destino", e2.run(1_100_000, 15_000, DERP_ALERT_DEST=""))
+eq("T22 observe-only sai limpo", e2.last.returncode, 0)
+e2.close()
+e.close()
+
+# ---------------------------------------------------------------------------
+# T23 — error_queue PARTICIPA da decisao. Fila que recusa tudo que chega tem
+# dropped parado e error_queue crescendo: antes isso passava batido.
+# ---------------------------------------------------------------------------
+e = Env()
+e.run(1_000_000, 10_000, errq=0)
+silent("T23 primeira janela so-errq nao basta", e.run(1_100_000, 10_000, errq=5_000))
+eq("T23 mas conta como janela ruim", e.state()["consecutive_breaches"], 1)
+speaks("T23 duas janelas so-errq alertam", e.run(1_200_000, 10_000, errq=10_000),
+       "recusados por fila cheia")
+e.close()
+
+# desligando a contagem, o mesmo cenario fica silencioso
+e = Env(DERP_COUNT_ERRQ=0)
+e.run(1_000_000, 10_000, errq=0)
+e.run(1_100_000, 10_000, errq=5_000)
+silent("T23 DERP_COUNT_ERRQ=0 ignora errq", e.run(1_200_000, 10_000, errq=10_000))
+e.close()
+
+# ---------------------------------------------------------------------------
+# T24 — COBERTURA por tempo real, nao por contagem. Amostras densas e
+# sobrepostas cobrem pouco tempo e nao podem declarar tendencia.
+# ---------------------------------------------------------------------------
+e = Env()
+now = int(time.time())
+# 400 amostras "prior" espremidas em ~28h, cada uma medindo 900s -> muita
+# sobreposicao. Pela contagem antiga dariam 100h de cobertura.
+e.seed_history([{"ts": "x", "epoch": now - 86400 - 3600 - i * 250, "dq": 50_000,
+                 "dd": 50, "derrq": 0, "span": 900, "ratio": 0.001}
+                for i in range(400)])
+# 60 amostras "recent" espremidas em ~4h
+e.seed_history([{"ts": "x", "epoch": now - i * 240, "dq": 50_000, "dd": 400,
+                 "derrq": 0, "span": 900, "ratio": 0.008} for i in range(1, 61)])
+e.run(1_000_000, 10_000)
+silent("T24 amostras sobrepostas nao declaram tendencia", e.run(1_010_000, 10_050))
 e.close()
 
 # ---------------------------------------------------------------------------
