@@ -254,16 +254,66 @@ assert_eq       "T14 binario ativo intacto"     "$(binver tailscaled)" "1.99.4"
 # T15 — guarda sobre a tabela REAL do repo: arm64 so volta com validacao
 # independente. Sem esse teste, um hash de fonte unica reentra sem revisao.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# T16 — FAIL-SAFE NA PROMOCAO: forca o `mv` do incoming para o dir versionado a
+# falhar, reinstalando a MESMA versao para onde `current` aponta. Antes isto
+# deixava o ponteiro pendurado (o dir era apagado antes do mv) enquanto o log
+# afirmava "segue com o binario anterior".
+# ---------------------------------------------------------------------------
+( cd "$SRV" && exec python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 ) &
+SRV_PID=$!
+disown "$SRV_PID" 2>/dev/null || true
+for _ in $(seq 1 40); do curl -sf -m 1 -o /dev/null "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
+
+# estado limpo: instala 3.0.0 e deixa `current` nela
+BINROOT="$WORK/bin2/ts"
+make_tgz 3.0.0 "$ARCH"
+echo "3.0.0  $ARCH  $(sum_of "$SRV/tailscale_3.0.0_$ARCH.tgz")" > "$SUMS"
+run_install 3.0.0 >/dev/null
+assert_eq "T16 preparo: 3.0.0 ativa" "$(active)" "3.0.0"
+
+# corrompe o binario ATIVO -> o gate decide reinstalar a mesma versao
+printf 'corrompido' > "$BINROOT/3.0.0/tailscaled"
+
+# stub de mv que falha SO na promocao incoming -> dir versionado
+mkdir -p "$WORK/stubmv"
+cat > "$WORK/stubmv/mv" <<'STUB'
+#!/bin/sh
+case "$*" in
+  *.stage.*)    exec /bin/mv "$@" ;;   # stage -> incoming: deixa passar
+  *.incoming.*) exit 1 ;;              # incoming -> destino: FALHA
+esac
+exec /bin/mv "$@"
+STUB
+chmod 0755 "$WORK/stubmv/mv"
+
+OUT="$(PATH="$WORK/stubmv:$PATH" run_install 3.0.0)"
+assert_contains "T16 detecta a promocao falha" "$OUT" "promocao falhou"
+if [ -d "$BINROOT/3.0.0" ]; then pass "T16 destino anterior preservado"; else fail "T16 destino anterior preservado" "dir apagado"; fi
+if [ -d "$BINROOT/current" ]; then pass "T16 ponteiro NAO fica pendurado"; else fail "T16 ponteiro NAO fica pendurado" "current pendurado"; fi
+
+# mesmo cenario, mas sem nenhuma versao cacheada valida: o ponteiro tem que ser
+# removido e o log tem que dizer, em vez de mentir sobre o fail-safe
+rm -rf "$BINROOT/3.0.0"
+OUT="$(PATH="$WORK/stubmv:$PATH" run_install 3.0.0)"
+if [ -L "$BINROOT/current" ]; then fail "T16 ponteiro pendurado e removido" "current continua pendurado"; else pass "T16 ponteiro pendurado e removido"; fi
+assert_contains "T16 avisa em vez de mentir" "$OUT" "ponteiro pendurado"
+
+BINROOT="$WORK/bin/ts"   # restaura o root dos demais testes
+
+# ---------------------------------------------------------------------------
+# T17 — guarda sobre a tabela REAL do repo
+# ---------------------------------------------------------------------------
 REAL_SUMS="$HERE/../tailscale-checksums.txt"
 if grep -qE '^[0-9.]+[[:space:]]+arm64[[:space:]]' "$REAL_SUMS" 2>/dev/null; then
-  fail "T15 tabela do repo sem arm64" "arm64 presente sem validacao independente"
+  fail "T17 tabela do repo sem arm64" "arm64 presente sem validacao independente"
 else
-  pass "T15 tabela do repo sem arm64"
+  pass "T17 tabela do repo sem arm64"
 fi
 if grep -qE '^1\.98\.9[[:space:]]+amd64[[:space:]]+11be30ad' "$REAL_SUMS" 2>/dev/null; then
-  pass "T15 pin amd64 presente na tabela do repo"
+  pass "T17 pin amd64 presente na tabela do repo"
 else
-  fail "T15 pin amd64 presente na tabela do repo"
+  fail "T17 pin amd64 presente na tabela do repo"
 fi
 
 echo

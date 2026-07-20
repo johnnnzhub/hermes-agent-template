@@ -173,13 +173,53 @@ ts_install(){
     log "ts: self-test reprovou ($ver): d=${vd:-none} c=${vc:-none}"; rm -rf "$stage"; return 1
   fi
   dest="$TS_BIN_ROOT/$ver"
-  rm -rf "$dest" 2>/dev/null || true
-  mv -f "$stage" "$dest" 2>/dev/null \
-    || { log "ts: promocao do stage falhou ($ver)"; rm -rf "$stage"; return 1; }
+  incoming="$TS_BIN_ROOT/.incoming.$ver.$$"
+  quarantine="$TS_BIN_ROOT/.quarantine.$ver.$$"
+  mv -f "$stage" "$incoming" 2>/dev/null \
+    || { log "ts: stage->incoming falhou ($ver)"; rm -rf "$stage"; return 1; }
+  # NUNCA apagar o destino antes de a nova versao estar pronta. A versao anterior
+  # deste bloco fazia `rm -rf "$dest"` e so depois o `mv`: com o binario ativo
+  # corrompido, o gate reinstala a MESMA versao para onde `current` aponta, o rm
+  # apagava esse dir e um mv falho deixava o ponteiro PENDURADO -- com o log
+  # dizendo "segue com o binario anterior" sem existir binario nenhum.
+  if [ -e "$dest" ]; then
+    mv -f "$dest" "$quarantine" 2>/dev/null \
+      || { log "ts: nao consegui isolar o destino anterior ($ver)"; rm -rf "$incoming"; return 1; }
+  fi
+  if ! mv -f "$incoming" "$dest" 2>/dev/null; then
+    log "ts: promocao falhou ($ver) -> restaurando o destino anterior"
+    [ -e "$quarantine" ] && mv -f "$quarantine" "$dest" 2>/dev/null
+    rm -rf "$incoming" 2>/dev/null || true
+    return 1
+  fi
+  rm -rf "$quarantine" 2>/dev/null || true
   ts_point_to "$ver" || { log "ts: troca do ponteiro falhou ($ver) -> mantem o anterior"; return 1; }
   log "ts: $ver ativo ($arch)"
   ts_gc "$ver"
   return 0
+}
+
+# Ultima linha de defesa: se `current` ficou pendurado (aponta para dir
+# inexistente), o PATH nao resolve e qualquer log de fail-safe seria mentira.
+# Tenta apontar para alguma versao cacheada que passe no self-test; nao havendo
+# nenhuma, REMOVE o ponteiro para o PATH cair em /data/bin, e diz isso alto.
+ts_repair_pointer(){
+  [ -L "$TS_BIN_ROOT/current" ] || return 0
+  [ -d "$TS_BIN_ROOT/current" ] && return 0     # resolve -> nada a reparar
+  local d b
+  for d in "$TS_BIN_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    [ -L "${d%/}" ] && continue
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac
+    if ts_promote_cached "$b"; then
+      log "ts: ponteiro pendurado reparado -> $b"
+      return 0
+    fi
+  done
+  rm -f "$TS_BIN_ROOT/current" 2>/dev/null || true
+  log "ts: ATENCAO ponteiro pendurado e nenhuma versao cacheada valida -> ponteiro removido, PATH cai em /data/bin"
+  return 1
 }
 
 ts_ensure(){
@@ -205,6 +245,8 @@ ts_ensure(){
       || ts_install "$TS_VERSION" "$A" \
       || log "ts: troca de versao falhou -> SEGUE com o binario anterior (fail-safe)"
   fi
+  # so afirmamos fail-safe depois de conferir que ainda ha binario resolvivel
+  ts_repair_pointer || true
 }
 
 mkdir -p "$TS_STATE_DIR" /var/run/tailscale /data/bin 2>/dev/null || true
