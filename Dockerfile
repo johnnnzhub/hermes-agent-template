@@ -9,6 +9,9 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
 ARG HERMES_REF=v2026.7.7.2
+# Fail closed if the release tag moves or HERMES_REF is overridden. The native
+# sidebar backport below is intentionally scoped to this exact upstream commit.
+ARG HERMES_BASE_SHA=9de9c25f620ff7f1ce0fd5457d596052d5159596
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -39,8 +42,12 @@ RUN apt-get update && \
 # and bricks the session on Anthropic's non-retryable 400. We bake it in.
 # When bumping HERMES_REF, re-check hermes-agent's pyproject.toml [all] and
 # the extras below against the new release's pyproject.toml.
+COPY patches/hermes-native-sidebar.patch /tmp/hermes-native-sidebar.patch
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
+    test "$(git rev-parse HEAD)" = "${HERMES_BASE_SHA}" && \
+    git apply --check /tmp/hermes-native-sidebar.patch && \
+    git apply /tmp/hermes-native-sidebar.patch && \
     uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
@@ -48,7 +55,8 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
     cd /opt/hermes-agent/ui-tui && \
     npm install --silent --no-fund --no-audit --progress=false && \
     npm run build && \
-    rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm
+    rm -rf /opt/hermes-agent/web /opt/hermes-agent/.git /root/.npm && \
+    rm -f /tmp/hermes-native-sidebar.patch
 
 # Why pre-build ui-tui (and why we don't delete it after):
 # - The dashboard's embedded Chat tab spawns `node ui-tui/dist/entry.js`

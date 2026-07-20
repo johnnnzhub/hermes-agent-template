@@ -1,0 +1,244 @@
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -2947,6 +2947,23 @@
+             current = child_id
+         return current
+ 
++    # SQL-level projection used by the native sidebar endpoint. Derive it from
++    # this release's schema so the backport stays complete as columns evolve,
++    # while keeping the payload-heavy rendered prompt inside SQLite.
++    _SESSION_COMPACT_EXCLUDED = frozenset({"system_prompt"})
++    _session_compact_cols_sql: Optional[str] = None
++
++    @classmethod
++    def _compact_session_cols(cls) -> str:
++        if cls._session_compact_cols_sql is None:
++            declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
++            cls._session_compact_cols_sql = ", ".join(
++                f"s.{name}"
++                for name in declared
++                if name not in cls._SESSION_COMPACT_EXCLUDED
++            )
++        return cls._session_compact_cols_sql
++
+     def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
+         """Distinct non-empty session cwds with usage stats, for repo discovery.
+ 
+@@ -2988,6 +3005,7 @@
+         archived_only: bool = False,
+         id_query: str = None,
+         search_query: str = None,
++        compact_rows: bool = False,
+     ) -> List[Dict[str, Any]]:
+         """List sessions with preview (first user message) and last active timestamp.
+ 
+@@ -3021,6 +3039,10 @@
+         its forward compression chain). A punctuation-stripped variant is also
+         matched so e.g. ``an94`` finds ``AN-94``. Only honored in the
+         ``order_by_last_active`` path.
++
++        Pass ``compact_rows=True`` to omit ``system_prompt`` from the SQL
++        projection. API list callers can then strip any remaining heavy fields
++        without first loading the rendered prompt into Python.
+         """
+         where_clauses = []
+         params = []
+@@ -3138,6 +3160,7 @@
+                 outer_where = (
+                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
+                 )
++            session_columns = self._compact_session_cols() if compact_rows else "s.*"
+             query = f"""
+                 WITH RECURSIVE chain(root_id, cur_id) AS (
+                     SELECT s.id, s.id FROM sessions s {where_sql}
+@@ -3161,7 +3184,7 @@
+                     FROM chain
+                     GROUP BY root_id
+                 )
+-                SELECT s.*,
++                SELECT {session_columns},
+                     COALESCE(
+                         (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                          FROM messages m
+@@ -3184,8 +3207,9 @@
+             # only applies to the outer select.
+             params = params + params + id_params + [limit, offset]
+         else:
++            session_columns = self._compact_session_cols() if compact_rows else "s.*"
+             query = f"""
+-                SELECT s.*,
++                SELECT {session_columns},
+                     COALESCE(
+                         (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                          FROM messages m
+@@ -3236,7 +3260,7 @@
+                 if tip_id == s["id"]:
+                     projected.append(s)
+                     continue
+-                tip_row = self._get_session_rich_row(tip_id)
++                tip_row = self._get_session_rich_row(tip_id, compact_rows=compact_rows)
+                 if not tip_row:
+                     projected.append(s)
+                     continue
+@@ -3322,13 +3346,13 @@
+             runs.append(s)
+         return runs
+ 
+-    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+-        """Fetch a single session with the same enriched columns as
+-        ``list_sessions_rich`` (preview + last_active). Returns None if the
+-        session doesn't exist.
+-        """
+-        query = """
+-            SELECT s.*,
++    def _get_session_rich_row(
++        self, session_id: str, compact_rows: bool = False
++    ) -> Optional[Dict[str, Any]]:
++        """Fetch one enriched session row, optionally without system_prompt."""
++        session_columns = self._compact_session_cols() if compact_rows else "s.*"
++        query = f"""
++            SELECT {session_columns},
+                 COALESCE(
+                     (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                      FROM messages m
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3971,6 +3971,138 @@
+     }
+ 
+ 
++_SIDEBAR_SESSION_HEAVY_FIELDS = ("system_prompt", "model_config")
++
++
++def _strip_sidebar_session_rows(sessions: List[Dict[str, Any]]) -> None:
++    for session in sessions:
++        for key in _SIDEBAR_SESSION_HEAVY_FIELDS:
++            session.pop(key, None)
++
++
++@app.get("/api/profiles/sessions/sidebar")
++def get_profiles_sessions_sidebar(
++    recents_profile: str = "all",
++    recents_limit: int = 20,
++    recents_exclude: str = None,
++    cron_limit: int = 50,
++    messaging_limit: int = 100,
++    messaging_exclude: str = None,
++):
++    """Return the desktop's three sidebar windows with one DB open per profile."""
++    from hermes_state import SessionDB
++    from hermes_cli import profiles as profiles_mod
++
++    try:
++        infos = profiles_mod.list_profiles()
++        targets: List[Tuple[str, Path]] = [(info.name, info.path) for info in infos]
++    except Exception:
++        _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
++        targets = []
++    if not targets:
++        targets.append(("default", profiles_mod.get_profile_dir("default")))
++
++    recents_scope = (recents_profile or "all").strip() or "all"
++    recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
++    messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
++    recents_cap = min(max(recents_limit, 1), 500)
++    cron_cap = min(max(cron_limit, 1), 500)
++    messaging_cap = min(max(messaging_limit, 1), 500)
++
++    recents_rows: List[Dict[str, Any]] = []
++    cron_rows: List[Dict[str, Any]] = []
++    messaging_rows: List[Dict[str, Any]] = []
++    recents_total = 0
++    recents_profile_totals: Dict[str, int] = {}
++    errors: List[Dict[str, str]] = []
++    now = time.time()
++
++    def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
++        for session in rows:
++            session["profile"] = name
++            session["is_default_profile"] = name == "default"
++            session["is_active"] = (
++                session.get("ended_at") is None
++                and (
++                    now
++                    - session.get("last_active", session.get("started_at", 0))
++                )
++                < 300
++            )
++            session["archived"] = bool(session.get("archived"))
++        return rows
++
++    def _slice(db, *, source=None, exclude=None, cap):
++        return db.list_sessions_rich(
++            source=source,
++            exclude_sources=exclude or None,
++            limit=cap,
++            offset=0,
++            min_message_count=1,
++            include_archived=False,
++            archived_only=False,
++            order_by_last_active=True,
++            compact_rows=True,
++        )
++
++    for name, home in targets:
++        db_path = Path(home) / "state.db"
++        if not db_path.exists():
++            continue
++        try:
++            db = SessionDB(db_path=db_path, read_only=True)
++        except Exception as exc:
++            errors.append({"profile": name, "error": str(exc)})
++            continue
++        try:
++            if recents_scope == "all" or name == recents_scope:
++                recents_rows.extend(
++                    _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
++                )
++                profile_total = db.session_count(
++                    exclude_sources=recents_exclude_list or None,
++                    min_message_count=1,
++                    include_archived=False,
++                    archived_only=False,
++                    exclude_children=True,
++                )
++                recents_total += profile_total
++                recents_profile_totals[name] = profile_total
++            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
++            messaging_rows.extend(
++                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
++            )
++        except Exception as exc:
++            errors.append({"profile": name, "error": str(exc)})
++        finally:
++            db.close()
++
++    def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
++        rows.sort(
++            key=lambda session: session.get("last_active")
++            or session.get("started_at")
++            or 0,
++            reverse=True,
++        )
++        window = rows[:cap]
++        _strip_sidebar_session_rows(window)
++        return window
++
++    return {
++        "recents": {
++            "sessions": _window(recents_rows, recents_cap),
++            "total": recents_total,
++            "profile_totals": recents_profile_totals,
++        },
++        "cron": {"sessions": _window(cron_rows, cron_cap)},
++        "messaging": {
++            "sessions": _window(messaging_rows, messaging_cap),
++            "total": len(messaging_rows),
++        },
++        "errors": errors,
++    }
++
++
+ @app.get("/api/sessions/search")
+ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+     """Search sessions by ID plus full-text message content using FTS5.
