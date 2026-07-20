@@ -222,6 +222,50 @@ if [ -d "$BINROOT/1.98.9" ]; then fail "T11 poda a mais antiga" "1.98.9 ainda ex
 LEFT="$(find "$BINROOT" -maxdepth 1 -name '.stage.*' 2>/dev/null | wc -l | tr -d ' ')"
 assert_eq "T12 sem stage orfao" "$LEFT" "0"
 
+# ---------------------------------------------------------------------------
+# T13 — ROLLBACK OFFLINE de verdade: servidor de pacotes DESLIGADO.
+# Estado: current=1.99.5, cache tem 1.99.4. Pedir 1.99.4 sem rede tem que
+# promover do cache. Nao basta o diretorio existir -- o teste executa o rollback.
+# ---------------------------------------------------------------------------
+kill "$SRV_PID" 2>/dev/null
+SRV_PID=""
+sleep 0.5
+
+OUT="$(run_install 1.99.4)"
+assert_contains "T13 promove do cache sem rede"    "$OUT" "promovido do cache local"
+assert_eq       "T13 ponteiro voltou pra anterior" "$(active)" "1.99.4"
+assert_eq       "T13 binario anterior responde"    "$(binver tailscaled)" "1.99.4"
+case "$OUT" in
+  *"download falhou"*) fail "T13 nao tenta a rede" "tentou baixar mesmo com cache valido";;
+  *)                   pass "T13 nao tenta a rede";;
+esac
+
+# ---------------------------------------------------------------------------
+# T14 — cache corrompido reprova no self-test e NAO e promovido.
+# Sem rede para cair de volta, o ponteiro tem que ficar onde estava.
+# ---------------------------------------------------------------------------
+printf 'lixo truncado' > "$BINROOT/1.99.5/tailscaled"
+OUT="$(run_install 1.99.5)"
+assert_contains "T14 cache corrompido reprova"  "$OUT" "reprovou no self-test"
+assert_eq       "T14 ponteiro NAO mudou"        "$(active)" "1.99.4"
+assert_eq       "T14 binario ativo intacto"     "$(binver tailscaled)" "1.99.4"
+
+# ---------------------------------------------------------------------------
+# T15 — guarda sobre a tabela REAL do repo: arm64 so volta com validacao
+# independente. Sem esse teste, um hash de fonte unica reentra sem revisao.
+# ---------------------------------------------------------------------------
+REAL_SUMS="$HERE/../tailscale-checksums.txt"
+if grep -qE '^[0-9.]+[[:space:]]+arm64[[:space:]]' "$REAL_SUMS" 2>/dev/null; then
+  fail "T15 tabela do repo sem arm64" "arm64 presente sem validacao independente"
+else
+  pass "T15 tabela do repo sem arm64"
+fi
+if grep -qE '^1\.98\.9[[:space:]]+amd64[[:space:]]+11be30ad' "$REAL_SUMS" 2>/dev/null; then
+  pass "T15 pin amd64 presente na tabela do repo"
+else
+  fail "T15 pin amd64 presente na tabela do repo"
+fi
+
 echo
 echo "passou: $PASSED   falhou: $FAILED"
 [ "$FAILED" -eq 0 ]

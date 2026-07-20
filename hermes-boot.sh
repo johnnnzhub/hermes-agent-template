@@ -102,6 +102,43 @@ ts_gc(){
   done
 }
 
+# Troca ATOMICA do ponteiro: symlink novo ao lado, renomeado por cima do atual.
+# -T (GNU) / -h (BSD) impedem que o mv entre no diretorio apontado pelo symlink
+# existente. A flag nao suportada falha ANTES de tocar em qualquer coisa, entao
+# o `||` escolhe a implementacao certa sem risco de acao parcial.
+ts_point_to(){
+  local ver="$1"
+  ln -sfn "$ver" "$TS_BIN_ROOT/.current.new" 2>/dev/null || return 1
+  if mv -Tf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null \
+     || mv -hf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$TS_BIN_ROOT/.current.new" 2>/dev/null || true
+  return 1
+}
+
+# Promove uma versao JA CACHEADA em $TS_BIN_ROOT/<ver> SEM REDE.
+# E isto que faz o rollback por TS_VERSION funcionar offline: se o diretorio
+# existe e os dois binarios passam no self-test, so troca o ponteiro. Sem este
+# caminho, um rollback exigiria baixar de novo -- justamente o que pode nao estar
+# disponivel na hora em que se precisa dele.
+ts_promote_cached(){
+  # Dois `local` separados de proposito: num `local a=X b=$a`, o $a ainda nao
+  # esta atribuido e sob `set -u` isso e unbound variable FATAL (SC2318).
+  local ver="$1"
+  local dir="$TS_BIN_ROOT/$ver" vd vc
+  [ -d "$dir" ] || return 1
+  vd="$(timeout 5 "$dir/tailscaled" --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  vc="$(timeout 5 "$dir/tailscale"  --version 2>/dev/null | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  if [ "$vd" != "$ver" ] || [ "$vc" != "$ver" ]; then
+    log "ts: cache de $ver reprovou no self-test (d=${vd:-none} c=${vc:-none})"; return 1
+  fi
+  ts_point_to "$ver" || { log "ts: troca do ponteiro falhou ($ver, cache)"; return 1; }
+  log "ts: $ver promovido do cache local (sem rede)"
+  ts_gc "$ver"
+  return 0
+}
+
 ts_install(){
   local ver="$1" arch="$2" want stage tgz got vd vc dest
   want="$(ts_sum "$ver" "$arch")"
@@ -139,19 +176,10 @@ ts_install(){
   rm -rf "$dest" 2>/dev/null || true
   mv -f "$stage" "$dest" 2>/dev/null \
     || { log "ts: promocao do stage falhou ($ver)"; rm -rf "$stage"; return 1; }
-  # Troca ATOMICA do ponteiro: symlink novo ao lado, renomeado por cima do atual.
-  # -T (GNU) / -h (BSD) impedem que o mv entre no diretorio apontado pelo symlink
-  # existente. A flag nao suportada falha ANTES de tocar em qualquer coisa, entao
-  # o `||` escolhe a implementacao certa sem risco de acao parcial.
-  ln -sfn "$ver" "$TS_BIN_ROOT/.current.new" 2>/dev/null || {
-    log "ts: criacao do ponteiro falhou ($ver)"; return 1; }
-  if mv -Tf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null \
-     || mv -hf "$TS_BIN_ROOT/.current.new" "$TS_BIN_ROOT/current" 2>/dev/null; then
-    log "ts: $ver ativo ($arch)"; ts_gc "$ver"; return 0
-  fi
-  rm -f "$TS_BIN_ROOT/.current.new" 2>/dev/null || true
-  log "ts: troca do ponteiro falhou ($ver) -> mantem o anterior"
-  return 1
+  ts_point_to "$ver" || { log "ts: troca do ponteiro falhou ($ver) -> mantem o anterior"; return 1; }
+  log "ts: $ver ativo ($arch)"
+  ts_gc "$ver"
+  return 0
 }
 
 ts_ensure(){
@@ -172,8 +200,10 @@ ts_ensure(){
     log "ts: $TS_VERSION ja ativo ($A)"
   else
     log "ts: instalado d=${have_d:-none} c=${have_c:-none} -> desejado $TS_VERSION ($A)"
-    ts_install "$TS_VERSION" "$A" \
-      || log "ts: upgrade falhou -> SEGUE com o binario anterior (fail-safe)"
+    # Cache local ANTES da rede: rollback por TS_VERSION tem que funcionar offline.
+    ts_promote_cached "$TS_VERSION" \
+      || ts_install "$TS_VERSION" "$A" \
+      || log "ts: troca de versao falhou -> SEGUE com o binario anterior (fail-safe)"
   fi
 }
 
