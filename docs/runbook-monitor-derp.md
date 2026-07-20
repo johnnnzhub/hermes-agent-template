@@ -66,19 +66,26 @@ hermes cron edit <job_id> --schedule "*/15 * * * *" --deliver "<plataforma>:<cha
 O scheduler escolhe o interpretador pela **extensão** (`.sh`/`.bash` → bash, resto
 → Python), ignorando o shebang. Manter o `.py`.
 
-### Sobre o `--deliver`
+### Sobre o `--deliver` — a ativação está BLOQUEADA até isto ser resolvido
 
 `--deliver` aceita `origin`, `local`, `telegram`, `discord`, `signal` ou
 `platform:chat_id`. A entrega tem que ser **apenas o grupo Briefing**, pelo
 gateway já configurado — nenhum token novo entra no repo.
 
-O `chat_id` do Briefing **não está fixado aqui de propósito**: resolvê-lo exige ler
-a configuração viva no container, e escrever um literal adivinhado seria pior que
-deixar o passo explícito. Resolver antes de criar o job e conferir com um
-`hermes cron run <job_id>` de teste (seção de verificação).
+**O destino Briefing não existe hoje no diretório de canais vivo.** Enquanto não
+existir, sair do observe-only é proibido, e o próprio script recusa:
 
-Durante a fase 0 o job é silencioso por construção, então o `--deliver` fica
-apenas configurado, sem tráfego.
+```
+derp-loss: fora do observe-only sem destino de alerta resolvido
+(DERP_ALERT_DEST ou <state>/derp-loss.dest) -- nao alerta
+```
+
+Isso é falha fechada deliberada, com exit code 5. Um alerta que não sabe para onde
+vai é pior que nenhum: cria a impressão de cobertura. Não há placeholder no repo e
+não deve haver — o valor entra na ativação, depois de resolvido contra o
+diretório vivo, em `<state>/derp-loss.dest` ou na env `DERP_ALERT_DEST`.
+
+Durante a fase 0 o job é silencioso por construção e não exige destino.
 
 ### Fim da fase 0
 
@@ -135,18 +142,40 @@ Todos os limiares são env vars (`DERP_ACUTE_RATIO`, `DERP_MIN_QUEUED`,
    ```
    → sem saída, `exit=0`.
 3. Após ~30 min, `derp-loss.jsonl` tem 2 linhas com `dq`/`dd` plausíveis.
-4. **Testar o caminho de entrega sem esperar degradação**, num `DERP_STATE_DIR`
-   temporário — nunca no state real, que contaminaria a baseline:
+4. **Testar a ENTREGA de verdade — atravessando o scheduler.** Rodar
+   `python3 derp-loss.py` à mão prova apenas a stdout local: não passa pelo
+   scheduler, não exercita o `--deliver` e não diz nada sobre o destino estar
+   certo. O teste tem que ser um job real, temporário e controlado:
+
    ```
-   T=$(mktemp -d)
-   for i in 1 2 3; do
-     DERP_STATE_DIR="$T" DERP_OBSERVE_ONLY=0 DERP_MIN_SPAN_SECONDS=0 \
-     DERP_ACUTE_RATIO=0 DERP_MIN_QUEUED=0 DERP_MIN_DROPPED=0 \
-       python3 "$HERMES_HOME/scripts/derp-loss.py"
-   done
-   rm -rf "$T"
+   # a) script trivial que so imprime um token conhecido
+   cat > "$HERMES_HOME/scripts/derp-deliver-probe.sh" <<'EOF'
+   #!/bin/bash
+   echo "probe de entrega derp-loss: $(date -u +%FT%TZ)"
+   EOF
+   chmod +x "$HERMES_HOME/scripts/derp-deliver-probe.sh"
+
+   # b) job no-agent com o MESMO destino do monitor
+   hermes cron create "0 5 31 2 *" --name derp-deliver-probe --no-agent \
+     --script derp-deliver-probe.sh --deliver "<destino resolvido>"
+   #    (a expressao 31/02 nunca ocorre: o job so roda quando forcado abaixo)
+
+   # c) forcar a execucao no proximo tick e conferir
+   hermes cron list                      # pegar o job_id
+   hermes cron run <job_id>
+   hermes cron runs <job_id>             # confirmar sucesso da tentativa
    ```
-   Confirmar que a mensagem chegou ao Briefing e a nenhum outro canal.
+
+   Confirmar que a mensagem chegou **ao Briefing e a nenhum outro canal**, e só
+   então:
+
+   ```
+   hermes cron remove <job_id>
+   rm -f "$HERMES_HOME/scripts/derp-deliver-probe.sh"
+   ```
+
+   O probe usa script próprio, e não o `derp-loss.py`, justamente para não
+   escrever em `<state>` nem contaminar a baseline.
 
 ## Rollback
 

@@ -104,13 +104,43 @@ trata a detecção de auto-start, mas tem pouca quilometragem.
 
 ## Rollback
 
-Pré-digitar antes de começar.
+Pré-digitar antes de começar. **O rollback é simétrico à ida**: restaurar a
+variável e reiniciar não republica nada — o `serve` continuaria com a config de
+`hermes-iris`, órfã, e o nome antigo sem publicação.
 
 ```
+# 1. volta o hostname
 railway variable set TS_HOSTNAME=hermes-g2 --service Iris --skip-deploys
 railway variable list --kv --service Iris | grep TS_HOSTNAME
 railway restart --service Iris
+
+# 2. limpa a config do nome NOVO e republica o ANTIGO, na mesma sessao
+TS="tailscale --socket=/var/run/tailscale/tailscaled.sock"
+env -u PORT $TS serve reset
+env -u PORT $TS serve --bg --https=443 http://127.0.0.1:9200
 ```
+
+Confirmação — os quatro, nesta ordem:
+
+```
+# a) nó voltou ao nome antigo
+env -u PORT $TS status | grep hermes-g2
+
+# b) serve publica o ANTIGO e nada mais
+env -u PORT $TS serve status          # so hermes-g2...:443 -> 127.0.0.1:9200
+env -u PORT $TS funnel status         # vazio
+
+# c) o nome antigo responde
+curl -s -o /dev/null -w '%{http_code}\n' https://hermes-g2.tail390702.ts.net/
+
+# d) o nome NOVO nao ficou orfao (esperado: falha de resolucao/conexao)
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 \
+  https://hermes-iris.tail390702.ts.net/ || echo "hermes-iris nao responde (correto)"
+```
+
+O passo (d) não é zelo: um `serve` remanescente para `hermes-iris` deixaria dois
+nomes publicando o mesmo backend, e o cert do nome novo seguiria sendo renovado
+para um endereço que ninguém deveria usar.
 
 O cert antigo continua em `/data/.tailscale`, então a volta é rápida. Orçar 5 min
 até "confirmado restaurado".

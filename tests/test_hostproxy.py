@@ -111,7 +111,6 @@ async def main():
     papp.router.add_route("*", "/{tail:.*}", hostproxy.handle)
     proxy = TestServer(papp)
     await proxy.start_server()
-    base = f"http://127.0.0.1:{proxy.port}"
     wsbase = f"ws://127.0.0.1:{proxy.port}"
     # Host que o `tailscale serve` repassaria, e que o dashboard recusa com 400
     tailnet_host = "hermes-g2.tail390702.ts.net"

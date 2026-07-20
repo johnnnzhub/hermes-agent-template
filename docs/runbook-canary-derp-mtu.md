@@ -37,7 +37,16 @@ observação. É circular. Só o Teste 0, com a flag desligada, mede o estado re
    (`ssh herdr-runner-1`, chave `~/.ssh/hetzner-herdr`) funcionando de forma
    independente da tailnet. Se o canário derrubar a tailnet, é a mão remota.
    Testar depois de quebrar não conta.
-4. Decidir **antes** o destino do `TS_DEBUG_MTU=1024` — ver seção final.
+4. **Confirmar se o DERP forçado existe de fato neste runtime.** O experimento é
+   remover a flag; se ela não estiver aplicada aqui, não há o que remover e o
+   canário não deve rodar (viraria outro experimento, sem a pergunta original):
+   ```
+   systemctl show tailscaled -p Environment
+   sudo tr '\0' '\n' < /proc/$(pidof tailscaled)/environ | grep TS_DEBUG || echo "(nenhuma TS_DEBUG no processo)"
+   sudo systemd-analyze cat-config systemd/system/tailscaled.service | grep -n TS_DEBUG
+   ```
+   As três leituras juntas cobrem unit, drop-ins e `EnvironmentFile`. Se nenhuma
+   apontar `TS_DEBUG_ALWAYS_USE_DERP`, **parar aqui**.
 5. Rollback pré-digitado num segundo terminal; `journalctl -fu tailscaled` num
    terceiro.
 6. Janela em dia útil, não sexta. John presente do começo ao fim.
@@ -78,20 +87,35 @@ tailscale netcheck
 No host, via drop-in do systemd — o `tailscaled` do Hetzner é serviço, não
 container, então **reinicia-se só o daemon de rede**, sem derrubar a aplicação:
 
+O drop-in faz **uma coisa só**: neutralizar o DERP forçado. Nada de MTU — ver a
+seção final.
+
 ```
 sudo mkdir -p /etc/systemd/system/tailscaled.service.d
-sudo tee /etc/systemd/system/tailscaled.service.d/10-canary.conf >/dev/null <<'EOF'
+sudo tee /etc/systemd/system/tailscaled.service.d/90-canary.conf >/dev/null <<'EOF'
 [Service]
-Environment=TS_DEBUG_MTU=1024
+# 90- para ordenar DEPOIS de qualquer drop-in existente: para a mesma variavel,
+# a ultima atribuicao vence. Setar =0 (e nao apenas omitir) e o que neutraliza a
+# flag quando ela vem da unit, de outro drop-in ou de um EnvironmentFile --
+# omitir so garantiria que ESTE arquivo nao a define.
+Environment=TS_DEBUG_ALWAYS_USE_DERP=0
 EOF
 
 sudo systemctl daemon-reload
 sudo systemctl restart tailscaled
 ```
 
-Note que o drop-in **não** define `TS_DEBUG_ALWAYS_USE_DERP`: no Hetzner a flag
-nunca foi aplicada. Se por algum motivo ela existir no ambiente do serviço,
-removê-la aqui é o passo equivalente ao "desligar o forçamento".
+**Confirmar que a neutralização pegou, antes de qualquer teste:**
+
+```
+systemctl show tailscaled -p Environment | tr ' ' '\n' | grep TS_DEBUG
+sudo tr '\0' '\n' < /proc/$(pidof tailscaled)/environ | grep TS_DEBUG
+```
+
+Ambos têm que mostrar `TS_DEBUG_ALWAYS_USE_DERP=0` e nenhuma outra fonte
+sobrescrevendo. Se o processo ainda subir com `=1`, o drop-in perdeu para outra
+fonte e **o canário não começou** — investigar antes de medir qualquer coisa,
+porque todos os testes seguintes passariam medindo o relay de novo.
 
 Downtime: só a sessão da tailnet, enquanto o `tailscaled` reinicia (segundos). A
 aplicação e o dashboard não são reiniciados.
@@ -166,13 +190,14 @@ não há motivo para aceitar o risco. "Empatou" é NO-GO.
 Pré-digitar antes de começar. Não se compõe comando sob pressão.
 
 ```
-sudo rm -f /etc/systemd/system/tailscaled.service.d/10-canary.conf
+sudo rm -f /etc/systemd/system/tailscaled.service.d/90-canary.conf
 sudo systemctl daemon-reload
 sudo systemctl restart tailscaled
 ```
 
-Se o estado de partida incluía DERP forçado, repor a linha
-`Environment=TS_DEBUG_ALWAYS_USE_DERP=1` no drop-in em vez de removê-lo.
+Remover o drop-in restaura o estado de partida, que incluía o DERP forçado — é
+por isso que o canário **neutraliza por `=0` em vez de apagar a fonte original**:
+a volta é apagar um arquivo, não reconstruir configuração.
 
 Confirmação de que voltou:
 
@@ -190,14 +215,24 @@ Orçar 5 min até "confirmado restaurado".
 se não for GO em T+45, rollback independente de quão promissor pareça. Canário sem
 prazo vira debug em produção.
 
-## Sobre o `TS_DEBUG_MTU=1024`
+## Sobre o `TS_DEBUG_MTU=1024` — opção REJEITADA
 
-Permanece **hipótese de canário**, não estado final. Não é rede de proteção
-grátis: reduz throughput e adiciona overhead de fragmentação em todo caminho,
-inclusive DERP. Se o canário "der certo" e o MTU 1024 ficar permanente por
-inércia, trocou-se um contorno por outro e o ganho líquido pode ser negativo.
+Não entra neste procedimento, nem como rede de proteção temporária. Registrado
+aqui para que não seja reintroduzido por alguém que leia só o issue upstream.
 
-Decisão sobre mantê-lo: tomada **antes** do canário, não no calor do resultado.
+Duas razões:
+
+1. **Confunde o experimento.** A pergunta é "o caminho direto funciona sem o
+   relay forçado?". Aplicar MTU 1024 junto testa "o caminho direto funciona com
+   pacotes pequenos", que é outra pergunta — e cujo GO não autorizaria remover o
+   DERP forçado sem o MTU, que é o estado que se quer alcançar.
+2. **Não é grátis.** Reduz throughput e adiciona overhead de fragmentação em todo
+   caminho, inclusive DERP. Um "deu certo" com MTU 1024 permanente troca um
+   contorno por outro, possivelmente com ganho líquido negativo.
+
+Se o canário der NO-GO por payload grande truncado, aí sim MTU vira hipótese —
+como **experimento seguinte e separado**, com seu próprio GO/NO-GO, e nunca
+misturado a este.
 
 ## Precedente
 
