@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,7 +16,7 @@ import {
   waitFor,
 } from "./helpers/harness.mjs";
 
-test("prewarms one Hermes TUI and persists only the stable session id at 0600", async (t) => {
+test("prewarms one Hermes TUI and persists only session identifiers at 0600", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
 
@@ -20,9 +27,35 @@ test("prewarms one Hermes TUI and persists only the stable session id at 0600", 
     "session.json",
   );
   const state = JSON.parse(await readFile(statePath, "utf8"));
-  assert.deepEqual(Object.keys(state), ["sessionId"]);
+  assert.deepEqual(Object.keys(state), ["sessionId", "hermesSessionId"]);
   assert.equal(state.sessionId, harness.sessionId);
+  assert.equal(state.hermesSessionId, "iris-session-test-0001");
+  assert.notEqual(state.sessionId, state.hermesSessionId);
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("migrates the one-field session state without changing its client id", async () => {
+  const hermesHome = await mkdtemp(join(tmpdir(), "iris-legacy-session-"));
+  const stateDirectory = join(hermesHome, "terminal-mode");
+  const statePath = join(stateDirectory, "session.json");
+  await mkdir(stateDirectory, { recursive: true });
+  await writeFile(
+    statePath,
+    `${JSON.stringify({ sessionId: "legacy-session-0001" })}\n`,
+    { mode: 0o600 },
+  );
+  let harness;
+  try {
+    harness = await createHarness({ hermesHome });
+    assert.equal(harness.sessionId, "legacy-session-0001");
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), {
+      sessionId: "legacy-session-0001",
+      hermesSessionId: "legacy-session-0001",
+    });
+  } finally {
+    await harness?.close();
+    await rm(hermesHome, { recursive: true, force: true });
+  }
 });
 
 test("exposes one Iris G2 session and maps text/history/info to the official provider shape", async (t) => {
@@ -347,6 +380,36 @@ test("interrupt ACK alone settles the turn and keeps late events quarantined", a
   );
 });
 
+test("interrupt generation drops events that race ahead of the ACK", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+
+  await harness.provider.prompt(harness.sessionId, "__slow_pre_ack__");
+  await waitFor(() =>
+    messagesOf(harness).some(
+      (message) =>
+        message.type === "text_delta" &&
+        message.text === "BEFORE_PRE_ACK",
+    ),
+  );
+  const marker = messagesOf(harness).at(-1).id;
+  await harness.provider.interrupt(harness.sessionId);
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId)?.state === "idle",
+  );
+  const after = harness.events.getMessages(harness.sessionId, marker);
+  assert.equal(
+    after.some(
+      (message) =>
+        (message.type === "text_delta" &&
+          message.text === "LATE_PRE_ACK") ||
+        (message.type === "tool_start" &&
+          message.toolId === "late-pre-ack-tool"),
+    ),
+    false,
+  );
+});
+
 test("interrupt clears pending approvals so the session returns to idle", async (t) => {
   const harness = await createHarness({ approvalTimeoutMs: 100 });
   t.after(() => harness.close());
@@ -492,6 +555,42 @@ test("recovers the persisted session after a Hermes TUI crash", async (t) => {
         message.text === "Iris: after restart",
     ),
   );
+});
+
+test("keeps the client session stable when an empty Hermes draft expires", async () => {
+  const hermesHome = await mkdtemp(join(tmpdir(), "iris-draft-recovery-"));
+  let first;
+  let second;
+  try {
+    first = await createHarness({
+      hermesHome,
+      fakeEnv: { FAKE_STORED_SESSION_ID: "draft-one" },
+    });
+    const stableId = first.sessionId;
+    await first.close();
+    first = null;
+
+    second = await createHarness({
+      hermesHome,
+      fakeEnv: {
+        FAKE_RESUME_MODE: "missing",
+        FAKE_STORED_SESSION_ID: "draft-two",
+      },
+    });
+    assert.equal(second.sessionId, stableId);
+    const state = JSON.parse(
+      await readFile(
+        join(hermesHome, "terminal-mode", "session.json"),
+        "utf8",
+      ),
+    );
+    assert.equal(state.sessionId, stableId);
+    assert.equal(state.hermesSessionId, "draft-two");
+  } finally {
+    await first?.close();
+    await second?.close();
+    await rm(hermesHome, { recursive: true, force: true });
+  }
 });
 
 test("restart reconstructs the ambiguous accepted prompt from history", async () => {

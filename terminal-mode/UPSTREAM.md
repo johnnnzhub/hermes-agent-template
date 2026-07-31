@@ -14,6 +14,8 @@ event shapes while replacing those runtime behaviors with:
 - loopback-only binding enforced at both the Python supervisor and Node server;
 - official query-token authentication plus optional bearer-header support;
 - a single `claude` wire alias backed by the Hermes TUI JSON-RPC gateway;
+- a stable client-visible session handle separated from Hermes runtime and
+  draft-session identifiers;
 - bounded SSE replay;
 - CORS preflight compatible with the native client while API data remains
   authenticated;

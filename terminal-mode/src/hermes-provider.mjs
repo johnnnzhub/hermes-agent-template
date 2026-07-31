@@ -1,5 +1,8 @@
 import { RpcError } from "./rpc-client.mjs";
-import { SessionStore } from "./session-store.mjs";
+import {
+  createStableSessionId,
+  SessionStore,
+} from "./session-store.mjs";
 
 const WIRE_PROVIDER = "claude";
 const DEFAULT_TITLE = "Iris G2";
@@ -72,6 +75,7 @@ export class HermesProvider {
     this.generationGuard = generationGuard;
 
     this.stableSessionId = null;
+    this.hermesSessionId = null;
     this.liveSessionId = null;
     this.initialized = false;
     this.initializePromise = null;
@@ -127,7 +131,10 @@ export class HermesProvider {
   async initialize() {
     if (this.initializePromise) return this.initializePromise;
     this.initializePromise = (async () => {
-      this.stableSessionId = await this.store.read();
+      const persisted = await this.store.read();
+      this.stableSessionId =
+        persisted?.sessionId ?? createStableSessionId();
+      this.hermesSessionId = persisted?.hermesSessionId ?? null;
       await this.rpc.start();
       this.initialized = true;
       await this.#recover();
@@ -389,16 +396,26 @@ export class HermesProvider {
       if (!this.rpc.isReady) return;
       this.liveSessionId = null;
 
-      if (this.stableSessionId) {
+      if (this.hermesSessionId) {
         try {
           const resumed = await this.rpc.request("session.resume", {
-            session_id: this.stableSessionId,
+            session_id: this.hermesSessionId,
             cols: 80,
           });
           if (!resumed.session_id) {
             throw new RpcError("Hermes resume returned no live session id");
           }
           this.liveSessionId = resumed.session_id;
+          if (
+            typeof resumed.resumed === "string" &&
+            resumed.resumed.trim()
+          ) {
+            this.hermesSessionId = resumed.resumed.trim();
+          }
+          await this.store.write({
+            sessionId: this.stableSessionId,
+            hermesSessionId: this.hermesSessionId,
+          });
           this.#updateMetadata(resumed.info);
           await this.#rememberRecoveredPrompt(resumed.messages);
           return;
@@ -417,8 +434,11 @@ export class HermesProvider {
         throw new RpcError("Hermes create returned an incomplete session");
       }
       this.liveSessionId = created.session_id;
-      this.stableSessionId = created.stored_session_id;
-      await this.store.write(this.stableSessionId);
+      this.hermesSessionId = created.stored_session_id;
+      await this.store.write({
+        sessionId: this.stableSessionId,
+        hermesSessionId: this.hermesSessionId,
+      });
       this.#updateMetadata(created.info);
     })();
 

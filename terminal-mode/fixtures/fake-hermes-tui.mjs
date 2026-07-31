@@ -2,7 +2,8 @@ import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const liveSessionId = `live-${process.pid}`;
-const defaultStoredSessionId = "iris-session-test-0001";
+const defaultStoredSessionId =
+  process.env.FAKE_STORED_SESSION_ID || "iris-session-test-0001";
 const historyPath = process.env.FAKE_HISTORY_PATH;
 let storedSessionId = defaultStoredSessionId;
 let history = loadHistory();
@@ -183,6 +184,12 @@ function beginPrompt(text) {
     return;
   }
 
+  if (text === "__slow_pre_ack__") {
+    event("message.delta", { text: "BEFORE_PRE_ACK" });
+    active.kind = "slow-pre-ack";
+    return;
+  }
+
   if (text === "__crash__") {
     setTimeout(() => process.exit(23), 5);
     return;
@@ -288,6 +295,25 @@ input.on("line", (line) => {
     }
     case "session.interrupt": {
       const interrupted = active;
+      if (interrupted?.kind === "slow-pre-ack") {
+        event("message.delta", { text: "LATE_PRE_ACK" });
+        event("tool.start", {
+          name: "terminal",
+          tool_id: "late-pre-ack-tool",
+          args_text: "echo late",
+        });
+        ok(id, { status: "interrupted" });
+        setImmediate(() => {
+          event("message.complete", {
+            text: "LATE_PRE_ACK",
+            status: "interrupted",
+            usage: { input: 0, output: 0, total: 0, calls: 0 },
+          });
+          event("session.info", sessionInfo());
+          active = null;
+        });
+        break;
+      }
       ok(id, { status: "interrupted" });
       if (interrupted?.kind === "slow-ack-only") {
         setTimeout(() => {
