@@ -5,3 +5,7 @@ g2-bridge/
 ref_only/
 ref_ui_only/
 .claude/
+terminal-mode/node_modules/
+terminal-mode/test/
+terminal-mode/fixtures/
+tests/

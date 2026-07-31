@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # hermes-boot.sh v3 — reintroduz Tailscale (tailnet-only) no container Railway.
 # Dashboard segue LOCAL em 127.0.0.1:9119 (server.py o sobe); quem publica na
-# tailnet e o `tailscale serve` (https=443). SEM Funnel (nada publico). SEM
-# g2_proxy. SEM dashboard 0.0.0.0/--insecure. Encadeia o /app/start.sh ORIGINAL
-# (start.sh -> exec server.py: gateway/MCP/healthcheck 100% intactos).
+# tailnet e o `tailscale serve` (https=443). Com IRIS_TERMINAL_ENABLED, o bridge
+# Terminal Mode continua LOCAL em 127.0.0.1:3456 e ganha listener tailnet-only
+# separado (https=8443). SEM Funnel (nada publico). SEM dashboard
+# 0.0.0.0/--insecure. Encadeia o /app/start.sh ORIGINAL (start.sh -> exec
+# server.py: gateway/MCP/healthcheck publicos intactos).
 #
 # Startup chain: railway.toml startCommand=/app/hermes-boot.sh
 #   -> sobe tailscaled+serve em BACKGROUND -> exec /app/start.sh
@@ -23,6 +25,10 @@ TS_HOSTNAME="${TS_HOSTNAME:-hermes-g2}"
 TS_FQDN="${TS_HOSTNAME}.${TS_TAILNET}"
 DASH_PORT="${DASH_PORT:-9119}"   # dashboard LOCAL existente (server.py spawna)
 PROXY_PORT="${HOSTPROXY_PORT:-9200}"   # hostproxy loopback (Host-rewrite) -> dashboard
+TERMINAL_PORT="${IRIS_TERMINAL_PORT:-3456}"   # bridge Terminal Mode, sempre loopback
+TERMINAL_TS_PORT="${IRIS_TERMINAL_TS_PORT:-8443}"   # listener HTTPS separado na tailnet
+TERMINAL_READY_ATTEMPTS="${IRIS_TERMINAL_READY_ATTEMPTS:-30}"
+TERMINAL_READY_DELAY="${IRIS_TERMINAL_READY_DELAY:-2}"
 # Versao pinada + checksums controlados no repo (ver tailscale-checksums.txt).
 # O pin e REPRODUTIBILIDADE e ROLLBACK -- nao e correcao comprovada da perda no DERP.
 TS_VERSION="${TS_VERSION:-1.98.9}"; TS_VERSION="${TS_VERSION#v}"
@@ -37,6 +43,74 @@ export PATH="$TS_BIN_ROOT/current:/data/bin:$PATH"
 log(){ echo "[hermes-boot-v3] $*"; }
 ts(){ env -u PORT tailscale --socket="$TS_SOCK" "$@"; }
 running(){ ts status >/dev/null 2>&1; }
+terminal_enabled(){
+  case "${IRIS_TERMINAL_ENABLED:-0}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0;;
+    *) return 1;;
+  esac
+}
+terminal_ts_port_safe(){
+  case "$TERMINAL_TS_PORT" in
+    ""|*[!0-9]*|443)
+      log "WARN: IRIS_TERMINAL_TS_PORT invalida/colide com dashboard; listener Terminal Mode ignorado"
+      return 1
+      ;;
+  esac
+  [ "$TERMINAL_TS_PORT" -ge 1 ] 2>/dev/null \
+    && [ "$TERMINAL_TS_PORT" -le 65535 ] 2>/dev/null
+}
+terminal_remove_default_listener(){
+  # Um valor invalido nao pode impedir o rollback do listener padrao que pode
+  # ter ficado persistido por um deploy anterior. Nunca toca no dashboard 443.
+  ts funnel --https=8443 off 2>/dev/null || true
+  ts serve --https=8443 off 2>/dev/null || true
+}
+
+configure_terminal_serve(){
+  if ! terminal_ts_port_safe; then
+    terminal_remove_default_listener
+    return 0
+  fi
+  # Funnel permanece desligado mesmo se algum estado antigo tiver sido
+  # persistido no volume do Tailscale.
+  ts funnel --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+
+  if ! terminal_enabled; then
+    # Rollback explicito: remover um listener persistido e idempotente e nao
+    # afeta o dashboard em 443.
+    ts serve --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+    log "Terminal Mode desativado; serve $TERMINAL_TS_PORT explicitamente removido"
+    return 0
+  fi
+
+  local ready=0 i
+  for i in $(seq 1 "$TERMINAL_READY_ATTEMPTS"); do
+    if curl -sf -m 2 -o /dev/null "http://127.0.0.1:$TERMINAL_PORT/healthz"; then
+      ready=1
+      break
+    fi
+    sleep "$TERMINAL_READY_DELAY"
+  done
+  if [ "$ready" = "1" ]; then
+    if ts serve --bg --https="$TERMINAL_TS_PORT" "http://127.0.0.1:$TERMINAL_PORT"; then
+      log "Terminal Mode tailnet-only ativo em HTTPS $TERMINAL_TS_PORT -> loopback $TERMINAL_PORT"
+    else
+      ts serve --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+      log "WARN: Tailscale recusou listener Terminal Mode; serve $TERMINAL_TS_PORT removido"
+    fi
+  else
+    # Nunca conservar uma rota stale apontando para um sidecar que nao ficou
+    # pronto neste boot.
+    ts serve --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+    log "WARN: Terminal Mode nao ficou pronto; serve $TERMINAL_TS_PORT removido"
+  fi
+}
+
+configure_serve_routes(){
+  # Superficie historica: dashboard segue em 443 via hostproxy.
+  ts serve --bg --https=443 "http://127.0.0.1:$PROXY_PORT"
+  configure_terminal_serve
+}
 
 # ---------------------------------------------------------------------------
 # Instalacao do Tailscale: pin + checksum do repo + troca atomica de ponteiro.
@@ -276,6 +350,16 @@ tailscale_up_serve(){
   timeout 90 env -u PORT tailscale --socket="$TS_SOCK" cert "$TS_FQDN" >/dev/null 2>&1 || true
   # 5) GARANTIR tailnet-only: desliga qualquer Funnel herdado.
   ts funnel --https=443 off 2>/dev/null || true
+  # Rollback cedo: nao espera os probes do dashboard para remover uma rota
+  # Terminal Mode persistida quando a flag esta desligada.
+  if ! terminal_enabled; then
+    if terminal_ts_port_safe; then
+      ts funnel --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+      ts serve --https="$TERMINAL_TS_PORT" off 2>/dev/null || true
+    else
+      terminal_remove_default_listener
+    fi
+  fi
   # 5a) espera o dashboard local (server.py o sobe) responder em 9119.
   for i in $(seq 1 30); do curl -sf -m 2 -o /dev/null "http://127.0.0.1:$DASH_PORT/" && break; sleep 2; done
   # 5b) hostproxy: o dashboard valida o header Host (so loopback) e recusa (400) o
@@ -288,11 +372,20 @@ tailscale_up_serve(){
     for i in $(seq 1 15); do curl -s -m 2 -o /dev/null "http://127.0.0.1:$PROXY_PORT/" && break; sleep 1; done
   fi
   # 5c) publica o HOSTPROXY na tailnet (nao o dashboard direto) — o Host-rewrite resolve o 400.
-  ts serve --bg --https=443 "http://127.0.0.1:$PROXY_PORT"
+  configure_serve_routes
   ts serve status 2>/dev/null || true
   ts funnel status 2>/dev/null || true   # esperado: vazio
   log "tailscale serve ativo (tailnet-only) -> hostproxy 127.0.0.1:$PROXY_PORT -> dashboard 127.0.0.1:$DASH_PORT"
 }
+
+# Hook restrito a testes: exercita apenas a configuracao das rotas Serve com
+# um binario `tailscale` forjado no PATH. Nao instala binario, nao sobe daemon
+# e nao encadeia o servidor.
+if [ "${HERMES_BOOT_TEST_SERVE_ONLY:-0}" = "1" ]; then
+  ts funnel --https=443 off 2>/dev/null || true
+  configure_serve_routes
+  exit 0
+fi
 
 # Hook de teste: roda SO a instalacao do binario e sai. Usado pelo
 # tests/test_boot_install.sh -- nao sobe daemon, nao toca no serve, nao encadeia o

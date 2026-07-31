@@ -1,0 +1,22 @@
+{
+  "name": "@cobaiateam/iris-even-terminal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hardened Even Terminal 0.8.1 compatibility bridge for Iris/Hermes",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "npm run verify:upstream && node --test --test-concurrency=1",
+    "test:unit": "node --test --test-concurrency=1",
+    "verify:upstream": "node scripts/verify-upstream.mjs"
+  },
+  "dependencies": {
+    "express": "5.2.1"
+  },
+  "devDependencies": {
+    "@evenrealities/even-terminal": "0.8.1"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "package": "@evenrealities/even-terminal",
+  "version": "0.8.1",
+  "files": {
+    "package.json": "497115fb33643901f90ec71f0cf72d8e2bf234ac896b6be49003a9c16e3b5114",
+    "dist/routes/core.js": "ecae8cd3b3593a34b274cd511604feb5179bf0864fe9c20b9250fbff6afca304",
+    "dist/routes/events.js": "b0c591c2311379617f80525e18d1869446fc5232ce61834df8ed7b0e2f84309f"
+  }
+}

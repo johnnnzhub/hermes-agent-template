@@ -5,7 +5,7 @@ Responsibilities:
   - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
   - Management API at /setup/api/* (config, status, logs, gateway, pairing)
   - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
-  - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
+  - Managed subprocesses: gateway, dashboard, and optional loopback G2 Terminal bridge
   - Cookie-based session auth at /login (HMAC-signed, 7-day expiry, httponly)
 
 Auth model: Basic Auth was dropped in favor of cookies because the Hermes React
@@ -67,6 +67,19 @@ PAIRING_TTL = 3600
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+
+# Native Even Terminal bridge. This process is deliberately loopback-only:
+# Tailscale Serve publishes it on a separate tailnet-only listener, while the
+# Railway HTTP listener continues to expose only this Starlette app.
+IRIS_TERMINAL_HOST = "127.0.0.1"
+try:
+    IRIS_TERMINAL_PORT = int(os.environ.get("IRIS_TERMINAL_PORT", "3456"))
+except ValueError:
+    IRIS_TERMINAL_PORT = 0
+IRIS_TERMINAL_ENABLED = os.environ.get(
+    "IRIS_TERMINAL_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+IRIS_TERMINAL_ENTRYPOINT = Path(__file__).parent / "terminal-mode" / "src" / "server.mjs"
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -947,6 +960,193 @@ class Dashboard:
 
 dash = Dashboard()
 
+
+# ── Even Terminal Mode sidecar ───────────────────────────────────────────────
+class TerminalModeSidecar:
+    """Manage the loopback-only Node bridge used by the native G2 Terminal.
+
+    Child output is drained but never copied to Railway logs: even a future
+    dependency regression must not make prompts or bearer tokens observable.
+    Only lifecycle state and exit codes are logged here.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = IRIS_TERMINAL_ENABLED,
+        host: str = IRIS_TERMINAL_HOST,
+        port: int = IRIS_TERMINAL_PORT,
+        command: tuple[str, ...] | None = None,
+        working_dir: str | Path | None = None,
+        max_restarts: int = 3,
+        restart_delays: tuple[float, ...] = (1.0, 2.0, 4.0),
+    ):
+        self.enabled = enabled
+        # Never accept a public bind address from configuration.
+        self.host = IRIS_TERMINAL_HOST if host != IRIS_TERMINAL_HOST else host
+        self.port = port
+        self.command = command or ("node", str(IRIS_TERMINAL_ENTRYPOINT))
+        self.working_dir = str(
+            working_dir or IRIS_TERMINAL_ENTRYPOINT.parent.parent
+        )
+        self.max_restarts = max(0, max_restarts)
+        self.restart_delays = restart_delays or (1.0,)
+        self.proc: asyncio.subprocess.Process | None = None
+        self.state = "disabled" if not enabled else "stopped"
+        self.started_at: float | None = None
+        self.restarts = 0
+        self._stop_requested = False
+        self._watch_task: asyncio.Task | None = None
+        self._drain_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    def _log(self, message: str) -> None:
+        print(f"[terminal] {message}", flush=True)
+
+    async def start(self) -> None:
+        if not self.enabled:
+            self.state = "disabled"
+            return
+        if not os.environ.get("IRIS_TERMINAL_TOKEN"):
+            self.state = "error"
+            self._log("not started: IRIS_TERMINAL_TOKEN is missing")
+            return
+        if (
+            not isinstance(self.port, int)
+            or isinstance(self.port, bool)
+            or not 1 <= self.port <= 65535
+        ):
+            self.state = "error"
+            self._log("not started: IRIS_TERMINAL_PORT is invalid")
+            return
+        async with self._lock:
+            if self.proc and self.proc.returncode is None:
+                return
+            self._stop_requested = False
+            self.restarts = 0
+            await self._spawn()
+
+    async def _spawn(self) -> None:
+        self.state = "starting"
+        env = {
+            **os.environ,
+            "HERMES_HOME": HERMES_HOME,
+            "IRIS_TERMINAL_HOST": self.host,
+            "IRIS_TERMINAL_PORT": str(self.port),
+            "NODE_ENV": "production",
+        }
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.command,
+                cwd=self.working_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+        except Exception as exc:
+            self.state = "error"
+            self._log(f"spawn failed: {type(exc).__name__}")
+            return
+        self.proc = proc
+        self.state = "running"
+        self.started_at = time.time()
+        self._log(f"started pid={proc.pid} on loopback")
+        self._drain_task = asyncio.create_task(self._drain(proc))
+        self._watch_task = asyncio.create_task(self._watch(proc))
+
+    async def _drain(self, proc: asyncio.subprocess.Process) -> None:
+        if proc.stdout is None:
+            return
+        try:
+            async for _ in proc.stdout:
+                pass
+        except Exception:
+            # The watcher reports process lifecycle. Child output is
+            # intentionally never retained or printed.
+            pass
+
+    async def _watch(self, proc: asyncio.subprocess.Process) -> None:
+        rc = await proc.wait()
+        if proc is not self.proc:
+            return
+        self.proc = None
+        self.started_at = None
+        if self._stop_requested:
+            self.state = "stopped"
+            return
+
+        self.state = "error"
+        self._log(f"exited code={rc}")
+        if self.restarts >= self.max_restarts:
+            self.state = "failed"
+            self._log("restart budget exhausted")
+            return
+
+        delay = self.restart_delays[
+            min(self.restarts, len(self.restart_delays) - 1)
+        ]
+        self.restarts += 1
+        self.state = "restarting"
+        await asyncio.sleep(delay)
+        if self._stop_requested:
+            self.state = "stopped"
+            return
+        async with self._lock:
+            if not self._stop_requested and self.proc is None:
+                await self._spawn()
+
+    async def stop(self) -> None:
+        if not self.enabled:
+            self.state = "disabled"
+            return
+        if self._stop_requested and self.state in {"stopping", "stopped"}:
+            return
+        self._stop_requested = True
+        self.state = "stopping"
+        proc = self.proc
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+
+        watch = self._watch_task
+        if watch and watch is not asyncio.current_task() and not watch.done():
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+        drain = self._drain_task
+        if drain and drain is not asyncio.current_task() and not drain.done():
+            await asyncio.gather(drain, return_exceptions=True)
+
+        self.proc = None
+        self.started_at = None
+        self.state = "stopped"
+        self._log("stopped")
+
+    def status(self) -> dict:
+        uptime = (
+            int(time.time() - self.started_at)
+            if self.started_at and self.state == "running"
+            else None
+        )
+        return {
+            "enabled": self.enabled,
+            "state": self.state,
+            "uptime": uptime,
+            "restarts": self.restarts,
+        }
+
+
+terminal = TerminalModeSidecar()
+
 # Shared async HTTP client for the reverse proxy. Created lazily so we pick up
 # the running event loop, torn down in lifespan.
 _http_client: httpx.AsyncClient | None = None
@@ -1016,7 +1216,12 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
-    return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
+    return JSONResponse({
+        "gateway": gw.status(),
+        "providers": providers,
+        "channels": channels,
+        "terminal": terminal.status(),
+    })
 
 
 async def api_logs(request: Request):
@@ -1575,6 +1780,7 @@ async def lifespan(app):
     # Dashboard runs always — it's the user-facing UI after setup is done,
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
+    await terminal.start()
     await auto_start()
     try:
         yield
@@ -1582,6 +1788,7 @@ async def lifespan(app):
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
+            terminal.stop(),
             return_exceptions=True,
         )
         global _http_client
@@ -1819,6 +2026,7 @@ if __name__ == "__main__":
     def _shutdown():
         loop.create_task(gw.stop())
         loop.create_task(dash.stop())
+        loop.create_task(terminal.stop())
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):

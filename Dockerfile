@@ -19,8 +19,8 @@ ARG HERMES_REF=v2026.7.7.2
 # stop signal still triggers our graceful shutdown. Standard container init
 # (same as Docker's `--init` flag and Kubernetes' pause container).
 #
-# Node.js is required only at build time to compile the Hermes React dashboard.
-# We strip the source + apt lists afterwards to keep the image lean.
+# Node.js compiles the Hermes React dashboard and remains the runtime for the
+# loopback-only Even Terminal bridge.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates git tini && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -64,6 +64,18 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
+
+# Install from the committed lock, verify the exact upstream 0.8.1 contract,
+# then remove the upstream Claude/Codex provider tree because the Iris bridge
+# only imports Express at runtime. All three commands intentionally share one
+# layer so the dev-only packages never survive in the final image.
+COPY terminal-mode/package.json terminal-mode/package-lock.json terminal-mode/UPSTREAM.md terminal-mode/upstream-lock.json /app/terminal-mode/
+COPY terminal-mode/scripts/verify-upstream.mjs /app/terminal-mode/scripts/verify-upstream.mjs
+RUN cd /app/terminal-mode && \
+    npm ci --no-audit --no-fund && \
+    npm run verify:upstream && \
+    npm prune --omit=dev --no-audit --no-fund
+COPY terminal-mode/src/ /app/terminal-mode/src/
 
 RUN mkdir -p /data/.hermes
 

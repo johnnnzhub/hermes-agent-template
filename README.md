@@ -67,6 +67,10 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `ADMIN_USERNAME` | `admin` | Basic auth username |
 | `ADMIN_PASSWORD` | *(auto-generated)* | Basic auth password — if unset, a random password is printed to logs |
 | `HERMES_REF` | *(pinned in Dockerfile)* | Hermes Agent version to install (any upstream git tag/branch). Set this to override the Dockerfile default without editing code — see [Updating Hermes](#updating-hermes). |
+| `IRIS_TERMINAL_ENABLED` | `0` | Enables the private Even G2 Terminal Mode sidecar and its dedicated Tailscale Serve listener. |
+| `IRIS_TERMINAL_TOKEN` | *(unset)* | CSPRNG-generated client token, at least 32 bytes. Required when Terminal Mode is enabled. |
+| `IRIS_TERMINAL_PORT` | `3456` | Loopback-only HTTP/SSE bridge port. |
+| `IRIS_TERMINAL_TS_PORT` | `8443` | Dedicated tailnet-only HTTPS listener. Port `443` remains reserved for the dashboard. |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
 
@@ -90,10 +94,50 @@ Railway Container
 │   ├── /            — Admin dashboard (Basic Auth)
 │   ├── /health      — Health check (no auth)
 │   └── /api/*       — Config, status, logs, gateway, pairing
-└── hermes gateway   — Managed as async subprocess
+├── hermes gateway   — Managed as async subprocess
+└── Even Terminal bridge (feature-flagged)
+    ├── 127.0.0.1:3456 — native HTTP/SSE compatibility API
+    ├── python -m tui_gateway.entry — one persistent Hermes session
+    └── Tailscale Serve :8443 — tailnet-only TLS; Funnel forced off
 ```
 
 The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.
+
+## Even G2 Terminal Mode
+
+The optional bridge lets the official Even Realities Terminal client talk to
+the existing Iris/Hermes identity and persisted `HERMES_HOME`. It exposes one
+wire-compatible provider (`claude`) and one durable Iris session. The client
+cannot select a working directory, provider, model, callback, URL, or arbitrary
+Hermes method.
+
+The bridge is disabled by default and fails closed when its token is missing or
+weak. It hard-rejects non-loopback binds, keeps Tailscale Funnel off, bounds SSE
+replay, redacts child output, and does not expose the upstream debug, Codex,
+metrics, update-mutation, or public-exposure routes. Native query-token auth is
+supported because it is part of the official client contract; optional Bearer
+auth is available for diagnostics. Rotate the token if a pairing URL or QR code
+is exposed.
+
+Enable it only after setting a strong `IRIS_TERMINAL_TOKEN`. The Terminal client
+connects to:
+
+```text
+https://<tailscale-hostname>:8443?token=<secret>&defaultProvider=claude&name=Iris
+```
+
+Keep the phone running the Even app on the same tailnet. The server supports
+text turns, streamed output, history, reconnect/replay, stop, questions, and
+tool approvals. Secret and sudo prompts fail closed and must be handled from
+the Iris admin surface.
+
+Rollback is idempotent: set `IRIS_TERMINAL_ENABLED=0` and redeploy. Boot removes
+only the dedicated HTTPS listener and preserves the dashboard on `443`, the
+public gateway, Glass API, Hermes config, and persisted conversation. Rotate or
+remove `IRIS_TERMINAL_TOKEN` separately if credential revocation is required.
+
+Implementation and upstream pin details live in
+[`terminal-mode/UPSTREAM.md`](terminal-mode/UPSTREAM.md).
 
 ## Running Locally
 
