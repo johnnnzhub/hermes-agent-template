@@ -1,5 +1,5 @@
 model:
-  default: "gpt-5.5"
+  default: "gpt-5.6-sol"
   provider: "openai-codex"
 
 # Cadeia de resiliência (tentada em ordem): Codex (oficial, acima) → OpenRouter (Claude).
@@ -76,7 +76,7 @@ session_reset:
 
 agent:
   max_iterations: 50
-  reasoning_effort: "medium"
+  reasoning_effort: "max"
 
 terminal:
   backend: local

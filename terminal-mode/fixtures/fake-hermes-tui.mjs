@@ -5,10 +5,19 @@ const liveSessionId = `live-${process.pid}`;
 const defaultStoredSessionId =
   process.env.FAKE_STORED_SESSION_ID || "iris-session-test-0001";
 const historyPath = process.env.FAKE_HISTORY_PATH;
+const profilePath = process.env.FAKE_PROFILE_PATH;
 let storedSessionId = defaultStoredSessionId;
 let history = loadHistory();
 let active = null;
 let requestCounter = 0;
+const globalProfile = Object.freeze({
+  model: "fake-hermes",
+  provider: "fake-global",
+  reasoningEffort: "medium",
+});
+let sessionProfile = loadSessionProfile();
+let lastCreateParams = null;
+const configSetCalls = [];
 
 function loadHistory() {
   if (!historyPath) return [];
@@ -23,6 +32,36 @@ function loadHistory() {
 function persistHistory() {
   if (!historyPath) return;
   writeFileSync(historyPath, JSON.stringify(history), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
+function loadSessionProfile() {
+  if (profilePath) {
+    try {
+      const parsed = JSON.parse(readFileSync(profilePath, "utf8"));
+      if (
+        typeof parsed?.model === "string" &&
+        typeof parsed?.provider === "string" &&
+        typeof parsed?.reasoningEffort === "string"
+      ) {
+        return parsed;
+      }
+    } catch {
+      // A missing profile file means this fake session has not been pinned yet.
+    }
+  }
+  return {
+    model: process.env.FAKE_RESUME_MODEL || "gpt-5.6-sol",
+    provider: process.env.FAKE_RESUME_PROVIDER || "openai-codex",
+    reasoningEffort: process.env.FAKE_RESUME_REASONING || "low",
+  };
+}
+
+function persistSessionProfile() {
+  if (!profilePath) return;
+  writeFileSync(profilePath, JSON.stringify(sessionProfile), {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -48,7 +87,9 @@ function event(type, payload, sessionId = liveSessionId) {
 
 function sessionInfo() {
   return {
-    model: "fake-hermes",
+    model: sessionProfile.model,
+    provider: sessionProfile.provider,
+    reasoning_effort: sessionProfile.reasoningEffort,
     version: "2026.test",
     cwd: "/tmp/iris",
     tools: { hermes: ["terminal", "web_search"] },
@@ -230,6 +271,17 @@ input.on("line", (line) => {
   switch (method) {
     case "session.create": {
       storedSessionId = defaultStoredSessionId;
+      lastCreateParams = { ...params };
+      sessionProfile = process.env.FAKE_IGNORE_CREATE_PROFILE
+        ? { ...globalProfile }
+        : {
+            model: String(params.model || globalProfile.model),
+            provider: String(params.provider || globalProfile.provider),
+            reasoningEffort: String(
+              params.reasoning_effort || globalProfile.reasoningEffort,
+            ),
+          };
+      persistSessionProfile();
       ok(id, {
         session_id: liveSessionId,
         stored_session_id: storedSessionId,
@@ -256,8 +308,66 @@ input.on("line", (line) => {
       setImmediate(() => event("session.info", sessionInfo()));
       break;
     }
+    case "config.set": {
+      configSetCalls.push({ ...params });
+      if (process.env.FAKE_CONFIG_SET_FAIL) {
+        error(id, 5001, "simulated config.set failure");
+        break;
+      }
+      if (params.key === "model") {
+        const parts = String(params.value || "").trim().split(/\s+/);
+        const providerIndex = parts.indexOf("--provider");
+        sessionProfile.model = parts[0] || sessionProfile.model;
+        if (providerIndex >= 0 && parts[providerIndex + 1]) {
+          sessionProfile.provider = parts[providerIndex + 1];
+        }
+        persistSessionProfile();
+        ok(id, {
+          key: "model",
+          value: sessionProfile.model,
+          warning: "",
+          confirm_required: false,
+        });
+        setImmediate(() => event("session.info", sessionInfo()));
+        break;
+      }
+      if (params.key === "reasoning") {
+        sessionProfile.reasoningEffort = String(params.value || "");
+        persistSessionProfile();
+        ok(id, {
+          key: "reasoning",
+          value: sessionProfile.reasoningEffort,
+        });
+        setImmediate(() => event("session.info", sessionInfo()));
+        break;
+      }
+      error(id, 4002, `unsupported config key: ${params.key}`);
+      break;
+    }
+    case "test.state":
+      ok(id, {
+        globalProfile,
+        sessionProfile,
+        lastCreateParams,
+        configSetCalls,
+      });
+      break;
+    case "test.emit_title":
+      ok(id, { emitted: true });
+      setImmediate(() =>
+        event("session.title", { title: String(params.title || "") }),
+      );
+      break;
     case "session.history":
       ok(id, { count: history.length, messages: history });
+      break;
+    case "session.activate":
+      ok(id, {
+        session_id: liveSessionId,
+        session_key: storedSessionId,
+        messages: history,
+        info: sessionInfo(),
+      });
       break;
     case "prompt.submit":
       ok(id, { status: "streaming" });

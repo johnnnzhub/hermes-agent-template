@@ -367,5 +367,20 @@ class DockerContractTests(unittest.TestCase):
         self.assertIn("COPY terminal-mode/src/ /app/terminal-mode/src/", dockerfile)
 
 
+class ModelProfileContractTests(unittest.TestCase):
+    def test_non_g2_default_is_codex_sol_with_max_reasoning(self) -> None:
+        deploy_config = (ROOT / "deploy-config.yaml").read_text()
+        self.assertRegex(
+            deploy_config,
+            r'(?m)^model:\n  default: "gpt-5\.6-sol"\n'
+            r'  provider: "openai-codex"$',
+        )
+        self.assertRegex(
+            deploy_config,
+            r'(?m)^agent:\n  max_iterations: 50\n'
+            r'  reasoning_effort: "max"$',
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

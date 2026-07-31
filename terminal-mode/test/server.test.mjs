@@ -152,7 +152,7 @@ test("accepts official query-token auth on API and SSE, with optional Bearer sup
     await fetch(withToken(harness, "/api/sessions?defaultProvider=claude")),
   );
   assert.equal(queryAuth.response.status, 200);
-  assert.equal(queryAuth.body.sessions[0].title, "Iris G2");
+  assert.equal(queryAuth.body.sessions[0].title, "HERMES");
 
   const bearerAuth = await json(
     await fetch(`${harness.baseUrl}/api/info`, {
@@ -286,6 +286,29 @@ test("implements the native session/info/update/status/messages/history contract
     { role: "user", text: "HTTP prompt" },
     { role: "assistant", text: "Iris: HTTP prompt" },
   ]);
+});
+
+test("ignores client-supplied model and reasoning choices", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+
+  const accepted = await post(harness, "/api/prompt", {
+    text: "profile remains server-owned",
+    provider: "claude",
+    model: "client-selected-model",
+    reasoning_effort: "max",
+  });
+  assert.equal(accepted.status, 202);
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId)?.state === "idle",
+  );
+
+  const runtime = await harness.rpc.request("test.state");
+  assert.deepEqual(runtime.sessionProfile, {
+    model: "gpt-5.6-sol",
+    provider: "openai-codex",
+    reasoningEffort: "low",
+  });
 });
 
 test("permission/question/interrupt endpoints retain the official request shapes", async (t) => {

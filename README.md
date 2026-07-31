@@ -107,10 +107,14 @@ The admin server runs on `$PORT` and manages the Hermes gateway as a child proce
 
 The optional bridge lets the official Even Realities Terminal client talk to
 the existing Iris/Hermes identity and persisted `HERMES_HOME`. It exposes one
-wire-compatible provider (`claude`) and one durable Iris session. Its
+wire-compatible provider (`claude`) and one durable session named `HERMES`,
+internally pinned to `openai-codex` / `gpt-5.6-sol` with `low` reasoning. Its
 client-visible handle remains stable even when Hermes discards an empty,
-unpersisted draft during a restart. The client cannot select a working
-directory, provider, model, callback, URL, or arbitrary Hermes method.
+unpersisted draft during a restart. A prompt sent after the client clears its
+selection through **New Session** is mapped back to that same handle; the
+bridge does not create or reset a second backend conversation. The client
+cannot select a working directory, provider, model, reasoning effort,
+callback, URL, or arbitrary Hermes method.
 
 The bridge is disabled by default and fails closed when its token is missing or
 weak. It hard-rejects non-loopback binds, keeps Tailscale Funnel off, bounds SSE

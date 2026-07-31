@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import {
   mkdir,
   mkdtemp,
@@ -15,6 +16,10 @@ import {
   messagesOf,
   waitFor,
 } from "./helpers/harness.mjs";
+import {
+  HermesProvider,
+  terminalSessionProfile,
+} from "../src/hermes-provider.mjs";
 
 test("prewarms one Hermes TUI and persists only session identifiers at 0600", async (t) => {
   const harness = await createHarness();
@@ -32,6 +37,18 @@ test("prewarms one Hermes TUI and persists only session identifiers at 0600", as
   assert.equal(state.hermesSessionId, "iris-session-test-0001");
   assert.notEqual(state.sessionId, state.hermesSessionId);
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+
+  const runtime = await harness.rpc.request("test.state");
+  assert.deepEqual(
+    {
+      title: runtime.lastCreateParams.title,
+      model: runtime.lastCreateParams.model,
+      provider: runtime.lastCreateParams.provider,
+      reasoningEffort: runtime.lastCreateParams.reasoning_effort,
+    },
+    terminalSessionProfile,
+  );
+  assert.deepEqual(runtime.configSetCalls, []);
 });
 
 test("migrates the one-field session state without changing its client id", async () => {
@@ -58,14 +75,14 @@ test("migrates the one-field session state without changing its client id", asyn
   }
 });
 
-test("exposes one Iris G2 session and maps text/history/info to the official provider shape", async (t) => {
+test("exposes one HERMES session and maps text/history/info to the official provider shape", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
 
   const sessions = await harness.provider.listSessions(10);
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, harness.sessionId);
-  assert.equal(sessions[0].title, "Iris G2");
+  assert.equal(sessions[0].title, "HERMES");
   assert.equal(sessions[0].provider, "claude");
 
   const info = await harness.provider.getInfo();
@@ -115,6 +132,184 @@ test("exposes one Iris G2 session and maps text/history/info to the official pro
   assert.equal(messages[resultIndex - 2].type, "running_stats");
   assert.equal(typeof messages[resultIndex].durationMs, "number");
   assert.ok(messages[resultIndex].durationMs >= 0);
+});
+
+test("keeps the client-visible HERMES title invariant against Hermes title events", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+
+  await harness.rpc.request("test.emit_title", { title: "renamed internally" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const [session] = await harness.provider.listSessions(10);
+  assert.equal(session.title, "HERMES");
+});
+
+test("pins a resumed session without changing its client id or global profile", async () => {
+  const hermesHome = await mkdtemp(join(tmpdir(), "iris-profile-resume-"));
+  const stateDirectory = join(hermesHome, "terminal-mode");
+  const statePath = join(stateDirectory, "session.json");
+  const profilePath = join(hermesHome, "fake-session-profile.json");
+  await mkdir(stateDirectory, { recursive: true });
+  await writeFile(
+    statePath,
+    `${JSON.stringify({
+      sessionId: "stable-g2-session",
+      hermesSessionId: "stored-hermes-session",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await writeFile(
+    profilePath,
+    JSON.stringify({
+      model: "gpt-5.5",
+      provider: "openai-codex",
+      reasoningEffort: "medium",
+    }),
+    { mode: 0o600 },
+  );
+
+  let first;
+  let second;
+  try {
+    first = await createHarness({
+      hermesHome,
+      fakeEnv: { FAKE_PROFILE_PATH: profilePath },
+    });
+    assert.equal(first.sessionId, "stable-g2-session");
+    const firstRuntime = await first.rpc.request("test.state");
+    assert.deepEqual(firstRuntime.sessionProfile, {
+      model: "gpt-5.6-sol",
+      provider: "openai-codex",
+      reasoningEffort: "low",
+    });
+    assert.deepEqual(
+      firstRuntime.configSetCalls.map(({ key }) => key),
+      ["model", "reasoning"],
+    );
+    assert.match(firstRuntime.configSetCalls[0].value, /--session$/);
+    assert.equal(
+      firstRuntime.configSetCalls[0].confirm_expensive_model,
+      true,
+    );
+    assert.deepEqual(firstRuntime.globalProfile, {
+      model: "fake-hermes",
+      provider: "fake-global",
+      reasoningEffort: "medium",
+    });
+    await first.close();
+    first = null;
+
+    second = await createHarness({
+      hermesHome,
+      fakeEnv: { FAKE_PROFILE_PATH: profilePath },
+    });
+    assert.equal(second.sessionId, "stable-g2-session");
+    const secondRuntime = await second.rpc.request("test.state");
+    assert.deepEqual(secondRuntime.sessionProfile, {
+      model: "gpt-5.6-sol",
+      provider: "openai-codex",
+      reasoningEffort: "low",
+    });
+    assert.deepEqual(secondRuntime.configSetCalls, []);
+    assert.deepEqual(secondRuntime.globalProfile, firstRuntime.globalProfile);
+  } finally {
+    await first?.close();
+    await second?.close();
+    await rm(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test("repairs reasoning-only drift without a redundant model switch", async () => {
+  const hermesHome = await mkdtemp(join(tmpdir(), "iris-reasoning-drift-"));
+  const stateDirectory = join(hermesHome, "terminal-mode");
+  const profilePath = join(hermesHome, "fake-session-profile.json");
+  await mkdir(stateDirectory, { recursive: true });
+  await writeFile(
+    join(stateDirectory, "session.json"),
+    `${JSON.stringify({
+      sessionId: "stable-g2-reasoning",
+      hermesSessionId: "stored-g2-reasoning",
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await writeFile(
+    profilePath,
+    JSON.stringify({
+      model: "gpt-5.6-sol",
+      provider: "openai-codex",
+      reasoningEffort: "medium",
+    }),
+    { mode: 0o600 },
+  );
+
+  let harness;
+  try {
+    harness = await createHarness({
+      hermesHome,
+      fakeEnv: { FAKE_PROFILE_PATH: profilePath },
+    });
+    const runtime = await harness.rpc.request("test.state");
+    assert.deepEqual(runtime.configSetCalls.map(({ key }) => key), [
+      "reasoning",
+    ]);
+    assert.deepEqual(runtime.sessionProfile, {
+      model: "gpt-5.6-sol",
+      provider: "openai-codex",
+      reasoningEffort: "low",
+    });
+  } finally {
+    await harness?.close();
+    await rm(hermesHome, { recursive: true, force: true });
+  }
+});
+
+test("config.set failure keeps the provider unready", async () => {
+  class FailingConfigRpc extends EventEmitter {
+    isReady = true;
+
+    async start() {}
+
+    async stop() {
+      this.isReady = false;
+    }
+
+    async request(method) {
+      if (method === "session.create") {
+        return {
+          session_id: "live-fail",
+          stored_session_id: "stored-fail",
+          messages: [],
+          info: {
+            model: "gpt-5.5",
+            provider: "openai-codex",
+            reasoning_effort: "medium",
+          },
+        };
+      }
+      if (method === "config.set") {
+        throw new Error("simulated config.set failure");
+      }
+      throw new Error(`unexpected method: ${method}`);
+    }
+  }
+
+  const hermesHome = await mkdtemp(join(tmpdir(), "iris-profile-fail-"));
+  const rpc = new FailingConfigRpc();
+  const provider = new HermesProvider({
+    rpc,
+    hermesHome,
+    emit() {},
+  });
+  try {
+    await assert.rejects(
+      provider.initialize(),
+      /simulated config\.set failure/,
+    );
+    assert.equal(provider.isReady, false);
+  } finally {
+    await provider.stop();
+    await rm(hermesHome, { recursive: true, force: true });
+  }
 });
 
 test("filters Hermes system/tool records from native conversation history", async (t) => {

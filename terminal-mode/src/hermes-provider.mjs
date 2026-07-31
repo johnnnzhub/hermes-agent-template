@@ -5,7 +5,20 @@ import {
 } from "./session-store.mjs";
 
 const WIRE_PROVIDER = "claude";
-const DEFAULT_TITLE = "Iris G2";
+const DEFAULT_TITLE = "HERMES";
+const REQUIRED_MODEL = "gpt-5.6-sol";
+const REQUIRED_PROVIDER = "openai-codex";
+const REQUIRED_REASONING = "low";
+const REQUIRED_MODEL_SWITCH =
+  `${REQUIRED_MODEL} --provider ${REQUIRED_PROVIDER} --session`;
+const PROFILE_READY_TIMEOUT_MS = 30_000;
+
+export const terminalSessionProfile = Object.freeze({
+  title: DEFAULT_TITLE,
+  model: REQUIRED_MODEL,
+  provider: REQUIRED_PROVIDER,
+  reasoningEffort: REQUIRED_REASONING,
+});
 
 const silentLogger = {
   info() {},
@@ -56,7 +69,6 @@ export class HermesProvider {
     hermesHome,
     emit,
     logger = silentLogger,
-    title = DEFAULT_TITLE,
     approvalTimeoutMs = 120_000,
     questionTimeoutMs = 120_000,
     dedupeWindowMs = 15_000,
@@ -67,7 +79,7 @@ export class HermesProvider {
     this.rpc = rpc;
     this.emit = emit;
     this.logger = logger;
-    this.title = title;
+    this.title = DEFAULT_TITLE;
     this.store = new SessionStore(hermesHome);
     this.approvalTimeoutMs = approvalTimeoutMs;
     this.questionTimeoutMs = questionTimeoutMs;
@@ -80,11 +92,16 @@ export class HermesProvider {
     this.initialized = false;
     this.initializePromise = null;
     this.recoverPromise = null;
+    this.profilePromise = null;
+    this.profileReady = false;
+    this.profileWaiters = new Set();
     this.metadata = {
       cwd: "",
-      model: "Hermes",
+      model: "",
+      provider: "",
+      reasoningEffort: "",
       version: "Unknown",
-      title,
+      title: DEFAULT_TITLE,
       timestamp: new Date().toISOString(),
     };
 
@@ -124,7 +141,10 @@ export class HermesProvider {
 
   get isReady() {
     return Boolean(
-      this.rpc.isReady && this.liveSessionId && this.stableSessionId,
+      this.rpc.isReady &&
+        this.liveSessionId &&
+        this.stableSessionId &&
+        this.profileReady,
     );
   }
 
@@ -159,6 +179,10 @@ export class HermesProvider {
     this.pendingQuestions = [];
     this.initialized = false;
     this.liveSessionId = null;
+    this.profileReady = false;
+    this.#rejectProfileWaiters(
+      new ProviderError("Iris terminal profile stopped", 503),
+    );
     await this.rpc.stop();
   }
 
@@ -185,7 +209,7 @@ export class HermesProvider {
     return [
       {
         id: this.stableSessionId,
-        title: this.metadata.title,
+        title: DEFAULT_TITLE,
         timestamp: this.metadata.timestamp,
         cwd: this.metadata.cwd,
         provider: WIRE_PROVIDER,
@@ -383,6 +407,10 @@ export class HermesProvider {
   async #ensureSession() {
     if (!this.initialized) await this.initialize();
     if (this.isReady) return;
+    if (this.rpc.isReady && this.liveSessionId && this.stableSessionId) {
+      await this.#ensureRequiredProfile();
+      if (this.isReady) return;
+    }
     await this.rpc.start();
     await this.#recover();
     if (!this.isReady) {
@@ -395,6 +423,10 @@ export class HermesProvider {
     this.recoverPromise = (async () => {
       if (!this.rpc.isReady) return;
       this.liveSessionId = null;
+      this.profileReady = false;
+      this.metadata.model = "";
+      this.metadata.provider = "";
+      this.metadata.reasoningEffort = "";
 
       if (this.hermesSessionId) {
         try {
@@ -417,6 +449,7 @@ export class HermesProvider {
             hermesSessionId: this.hermesSessionId,
           });
           this.#updateMetadata(resumed.info);
+          await this.#ensureRequiredProfile(resumed.info);
           await this.#rememberRecoveredPrompt(resumed.messages);
           return;
         } catch (error) {
@@ -429,6 +462,9 @@ export class HermesProvider {
         source: "even-terminal",
         cols: 80,
         close_on_disconnect: false,
+        model: REQUIRED_MODEL,
+        provider: REQUIRED_PROVIDER,
+        reasoning_effort: REQUIRED_REASONING,
       });
       if (!created.session_id || !created.stored_session_id) {
         throw new RpcError("Hermes create returned an incomplete session");
@@ -440,6 +476,7 @@ export class HermesProvider {
         hermesSessionId: this.hermesSessionId,
       });
       this.#updateMetadata(created.info);
+      await this.#ensureRequiredProfile(created.info);
     })();
 
     try {
@@ -512,15 +549,27 @@ export class HermesProvider {
 
     if (type === "session.info") {
       this.#updateMetadata(payload);
+      if (
+        this.initialized &&
+        this.liveSessionId &&
+        this.profileReady &&
+        !this.#profileMatches()
+      ) {
+        void this.#ensureRequiredProfile(payload, { probeActive: true }).catch(() => {
+          this.logger.error(
+            "[terminal-mode] required G2 session profile could not be restored",
+          );
+        });
+      }
       if (this.discardInterrupted && this.turnActive) {
         this.#settleInterrupted();
       }
       return;
     }
     if (type === "session.title") {
-      if (typeof payload.title === "string" && payload.title.trim()) {
-        this.metadata.title = payload.title.trim().slice(0, 64);
-      }
+      // The native client exposes exactly one server-owned session. Hermes may
+      // derive or mutate its internal DB title, but that must never rename the
+      // G2 surface or make "New Session" appear to create another identity.
       return;
     }
 
@@ -898,6 +947,10 @@ export class HermesProvider {
 
   #handleCrash() {
     this.liveSessionId = null;
+    this.profileReady = false;
+    this.#rejectProfileWaiters(
+      new ProviderError("Iris terminal profile interrupted", 503),
+    );
     this.discardInterrupted = false;
     this.turnActive = false;
     this.turnStartedAt = 0;
@@ -951,9 +1004,145 @@ export class HermesProvider {
     if (typeof info.model === "string" && info.model) {
       this.metadata.model = info.model;
     }
+    if (typeof info.provider === "string" && info.provider) {
+      this.metadata.provider = info.provider;
+    }
+    if (
+      typeof info.reasoning_effort === "string" &&
+      info.reasoning_effort
+    ) {
+      this.metadata.reasoningEffort = info.reasoning_effort;
+    }
     if (typeof info.version === "string" && info.version) {
       this.metadata.version = info.version;
     }
+    this.#resolveProfileWaiters();
+  }
+
+  #modelProfileMatches(info = this.metadata) {
+    return (
+      info.model === REQUIRED_MODEL &&
+      info.provider === REQUIRED_PROVIDER
+    );
+  }
+
+  #profileMatches(info = this.metadata) {
+    const reasoningEffort =
+      info.reasoningEffort ?? info.reasoning_effort ?? "";
+    return (
+      info.model === REQUIRED_MODEL &&
+      info.provider === REQUIRED_PROVIDER &&
+      reasoningEffort === REQUIRED_REASONING
+    );
+  }
+
+  async #ensureRequiredProfile(
+    info = this.metadata,
+    { probeActive = false } = {},
+  ) {
+    if (this.profilePromise) return this.profilePromise;
+    this.profileReady = false;
+    this.profilePromise = (async () => {
+      if (!this.liveSessionId) {
+        throw new ProviderError("Iris session is unavailable", 503);
+      }
+
+      if (probeActive) {
+        const active = await this.rpc.request("session.activate", {
+          session_id: this.liveSessionId,
+        });
+        if (!active?.info || typeof active.info !== "object") {
+          throw new ProviderError(
+            "Hermes did not report the active G2 session profile",
+            503,
+          );
+        }
+        info = active.info;
+        this.#updateMetadata(info);
+        if (this.#profileMatches(info)) {
+          this.profileReady = true;
+          return;
+        }
+      }
+
+      if (!this.#modelProfileMatches(info)) {
+        const modelResult = await this.rpc.request("config.set", {
+          session_id: this.liveSessionId,
+          key: "model",
+          value: REQUIRED_MODEL_SWITCH,
+          confirm_expensive_model: true,
+        });
+        if (
+          modelResult?.confirm_required === true ||
+          modelResult?.value !== REQUIRED_MODEL
+        ) {
+          throw new ProviderError(
+            "Hermes rejected the required G2 model profile",
+            503,
+          );
+        }
+      }
+
+      const reportedReasoning =
+        info.reasoningEffort ?? info.reasoning_effort ?? "";
+      if (reportedReasoning !== REQUIRED_REASONING) {
+        const reasoningResult = await this.rpc.request("config.set", {
+          session_id: this.liveSessionId,
+          key: "reasoning",
+          value: REQUIRED_REASONING,
+        });
+        if (reasoningResult?.value !== REQUIRED_REASONING) {
+          throw new ProviderError(
+            "Hermes rejected the required G2 reasoning profile",
+            503,
+          );
+        }
+      }
+
+      await this.#waitForRequiredProfile();
+      this.profileReady = true;
+    })();
+
+    try {
+      await this.profilePromise;
+    } finally {
+      this.profilePromise = null;
+    }
+  }
+
+  #waitForRequiredProfile() {
+    if (this.#profileMatches()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this.profileWaiters.delete(waiter);
+        reject(
+          new ProviderError(
+            "Hermes did not confirm the required G2 session profile",
+            503,
+          ),
+        );
+      }, PROFILE_READY_TIMEOUT_MS);
+      waiter.timer.unref?.();
+      this.profileWaiters.add(waiter);
+    });
+  }
+
+  #resolveProfileWaiters() {
+    if (!this.#profileMatches()) return;
+    for (const waiter of this.profileWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve();
+    }
+    this.profileWaiters.clear();
+  }
+
+  #rejectProfileWaiters(error) {
+    for (const waiter of this.profileWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.profileWaiters.clear();
   }
 
   #safeEmit(message) {

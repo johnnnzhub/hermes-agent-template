@@ -38,7 +38,7 @@ if [ -n "${CODEX_AUTH_B64:-}" ] && [ ! -f "$HOME/.codex/auth.json" ]; then
 fi
 
 # Config gerenciado: aplica o deploy-config.yaml versionado (provider openai-codex,
-# model gpt-5.5, fallback + auxiliary em OpenRouter) a CADA boot. Self-heal da trap
+# model gpt-5.6-sol, fallback + auxiliary em OpenRouter) a CADA boot. Self-heal da trap
 # do write_config_yaml em server.py — salvar na UI /setup re-força provider "auto",
 # mas o próximo boot restaura o provider correto a partir deste arquivo.
 if [ -f /app/deploy-config.yaml ]; then
@@ -57,7 +57,7 @@ fi
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
 
 # is_config_complete() em server.py lê LLM_MODEL do /data/.hermes/.env — mantém em
-# sync com a env var LLM_MODEL do Railway (gpt-5.5) sem precisar salvar pela UI.
+# sync com a env var LLM_MODEL do Railway (gpt-5.6-sol) sem precisar salvar pela UI.
 if [ -n "${LLM_MODEL:-}" ]; then
   if grep -q '^LLM_MODEL=' /data/.hermes/.env; then
     sed -i "s|^LLM_MODEL=.*|LLM_MODEL=${LLM_MODEL}|" /data/.hermes/.env

@@ -16,6 +16,8 @@ event shapes while replacing those runtime behaviors with:
 - a single `claude` wire alias backed by the Hermes TUI JSON-RPC gateway;
 - a stable client-visible session handle separated from Hermes runtime and
   draft-session identifiers;
+- a server-owned `HERMES` profile pinned per session to
+  `openai-codex` / `gpt-5.6-sol` / `low`, without changing global defaults;
 - bounded SSE replay;
 - CORS preflight compatible with the native client while API data remains
   authenticated;
