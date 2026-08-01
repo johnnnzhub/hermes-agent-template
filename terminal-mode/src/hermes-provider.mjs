@@ -5,7 +5,7 @@ import {
 } from "./session-store.mjs";
 
 const WIRE_PROVIDER = "claude";
-const DEFAULT_TITLE = "HERMES";
+const DEFAULT_TITLE = "Hermes";
 const REQUIRED_MODEL = "gpt-5.6-sol";
 const REQUIRED_PROVIDER = "openai-codex";
 const REQUIRED_REASONING = "low";

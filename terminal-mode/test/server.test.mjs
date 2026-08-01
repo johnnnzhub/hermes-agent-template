@@ -152,7 +152,7 @@ test("accepts official query-token auth on API and SSE, with optional Bearer sup
     await fetch(withToken(harness, "/api/sessions?defaultProvider=claude")),
   );
   assert.equal(queryAuth.response.status, 200);
-  assert.equal(queryAuth.body.sessions[0].title, "HERMES");
+  assert.equal(queryAuth.body.sessions[0].title, "Hermes");
 
   const bearerAuth = await json(
     await fetch(`${harness.baseUrl}/api/info`, {

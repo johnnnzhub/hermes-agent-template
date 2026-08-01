@@ -69,4 +69,4 @@ for (const value of REQUIRED) {
 }
 
 if (failed) process.exit(1)
-console.log(`Bundle HERMES limpo: ${FORBIDDEN.length} proibições e ${REQUIRED.length} contratos verificados.`)
+console.log(`Bundle Hermes limpo: ${FORBIDDEN.length} proibições e ${REQUIRED.length} contratos verificados.`)

@@ -1,16 +1,16 @@
 {
   "package_id": "com.cobaiateam.iris.glasses",
   "edition": "202601",
-  "name": "HERMES",
-  "version": "0.4.1",
+  "name": "Hermes",
+  "version": "0.4.2",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
-    { "name": "g2-microphone", "desc": "Capturar voz para a conversa privada com o HERMES." },
+    { "name": "g2-microphone", "desc": "Capturar voz para a conversa privada com o Hermes." },
     {
       "name": "network",
-      "desc": "Acessar a sessão privada do HERMES pela tailnet.",
+      "desc": "Acessar a sessão privada do Hermes pela tailnet.",
       "whitelist": ["https://hermes-g2.tail390702.ts.net:8443"]
     }
   ],

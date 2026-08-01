@@ -58,5 +58,5 @@ createServer((request, response) => {
   }
   send(response, 404, { error: 'Not found' })
 }).listen(port, '127.0.0.1', () => {
-  console.log(`HERMES mock listening on http://127.0.0.1:${port}`)
+  console.log(`Hermes mock listening on http://127.0.0.1:${port}`)
 })

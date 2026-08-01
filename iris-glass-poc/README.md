@@ -1,4 +1,4 @@
-# HERMES for Even G2
+# Hermes for Even G2
 
 Private Even Hub SDK app for the existing Iris/Hermes conversation. It shares
 the exact persistent session already used by Even Terminal Mode; there is no
@@ -40,7 +40,7 @@ npm run pack
 ```
 
 `npm run pack` type-checks, builds the production bundle, rejects diagnostic,
-task-era, localhost, and public-Railway strings, then writes `hermes.ehpk`.
+task-era, localhost, and public-Railway strings, then writes `Hermes.ehpk`.
 This artifact contains the dedicated Glass credential and is for private/beta
 installation only.
 
