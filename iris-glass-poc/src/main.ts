@@ -30,6 +30,7 @@ import {
   stopRecording,
 } from './voice'
 import { mountUi, setPreview, setStatus } from './ui'
+import { settleRenderAttempt, type RenderOutcome } from './renderState'
 
 mountUi()
 
@@ -76,6 +77,7 @@ const RENDER_GAP_MS = 250
 let lastRender = INITIAL_TEXT
 let renderTimer: number | null = null
 let renderInFlight = false
+let renderFailures = 0
 let hudDead = false
 let currentContent = INITIAL_TEXT
 
@@ -91,20 +93,27 @@ async function renderNow() {
   if (hudDead || renderInFlight || currentContent === lastRender) return
   renderInFlight = true
   const content = currentContent
+  let outcome: RenderOutcome = 'error'
+  let timeoutHandle: number | null = null
   try {
-    const result = await Promise.race([
-      bridge.rebuildPageContainer(new RebuildPageContainer(hudPayload(content))).then(() => 'ok' as const),
-      new Promise<'timeout'>(resolve => window.setTimeout(() => resolve('timeout'), RENDER_TIMEOUT_MS)),
+    outcome = await Promise.race([
+      bridge.rebuildPageContainer(new RebuildPageContainer(hudPayload(content))),
+      new Promise<'timeout'>(resolve => {
+        timeoutHandle = window.setTimeout(() => resolve('timeout'), RENDER_TIMEOUT_MS)
+      }),
     ])
-    if (result === 'timeout' && IS_DIAG) console.warn('rebuildPageContainer timeout')
-    lastRender = content
+    if (outcome !== true && IS_DIAG) console.warn(`rebuildPageContainer not acknowledged: ${outcome}`)
   } catch (error) {
     if (IS_DIAG) console.error('rebuildPageContainer failed:', error)
   } finally {
+    if (timeoutHandle !== null) window.clearTimeout(timeoutHandle)
+    const settled = settleRenderAttempt(lastRender, content, outcome, renderFailures)
+    lastRender = settled.lastConfirmed
+    renderFailures = settled.failures
     renderInFlight = false
     window.setTimeout(() => {
       if (!hudDead && currentContent !== lastRender) scheduleGlassesRender()
-    }, RENDER_GAP_MS)
+    }, settled.confirmed ? RENDER_GAP_MS : settled.retryDelayMs)
   }
 }
 

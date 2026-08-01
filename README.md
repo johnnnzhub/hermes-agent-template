@@ -71,7 +71,7 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `IRIS_TERMINAL_TOKEN` | *(unset)* | CSPRNG-generated client token, at least 32 bytes. Required when Terminal Mode is enabled. |
 | `IRIS_TERMINAL_PORT` | `3456` | Loopback-only HTTP/SSE bridge port. |
 | `IRIS_TERMINAL_TS_PORT` | `8443` | Dedicated tailnet-only HTTPS listener. Port `443` remains reserved for the dashboard. |
-| `GLASS_TOKEN` | *(unset)* | Dedicated Bearer token, at least 32 bytes, for the private HERMES SDK surface only. |
+| `GLASS_TOKEN` | *(unset)* | Dedicated Bearer token, at least 32 bytes, for the private Hermes SDK surface only. |
 | `IRIS_GLASS_STT_URL` | `https://n8n.cobaiateam.com.br/webhook/g2-voice` | Existing G2 PCM transcription endpoint used server-side. |
 | `IRIS_GLASS_STT_TOKEN` | *(unset)* | Server-side Bearer token for the G2 transcription endpoint; it is never baked into the plugin. |
 
@@ -111,7 +111,7 @@ The admin server runs on `$PORT` and manages the Hermes gateway as a child proce
 
 The optional bridge lets the official Even Realities Terminal client talk to
 the existing Iris/Hermes identity and persisted `HERMES_HOME`. It exposes one
-wire-compatible provider (`claude`) and one durable session named `HERMES`,
+wire-compatible provider (`claude`) and one durable session named `Hermes`,
 internally pinned to `openai-codex` / `gpt-5.6-sol` with `low` reasoning. Its
 client-visible handle remains stable even when Hermes discards an empty,
 unpersisted draft during a restart. A prompt sent after the client clears its
@@ -148,10 +148,10 @@ remove `IRIS_TERMINAL_TOKEN` separately if credential revocation is required.
 Implementation and upstream pin details live in
 [`terminal-mode/UPSTREAM.md`](terminal-mode/UPSTREAM.md).
 
-## HERMES SDK app for Even G2
+## Hermes SDK app for Even G2
 
 [`iris-glass-poc/`](iris-glass-poc/) packages a private Even Hub app named
-**HERMES**. It does not create another agent or conversation: both the SDK app
+**Hermes**. It does not create another agent or conversation: both the SDK app
 and Terminal Mode resolve the same single persisted session owned by the
 server. Opening the app loads the latest exchange; scroll navigates paginated
 history, one tap starts recording, and the next tap sends PCM audio. Hermes

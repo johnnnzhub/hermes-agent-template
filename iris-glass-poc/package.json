@@ -1,7 +1,7 @@
 {
   "name": "hermes-g2",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,9 +9,9 @@
     "preview": "vite preview",
     "build:smoke": "VITE_GLASS_DIAG=0 VITE_HERMES_API_BASE= npm run build",
     "build:prod": "VITE_GLASS_DIAG=0 VITE_HERMES_API_BASE=https://hermes-g2.tail390702.ts.net:8443 npm run build",
-    "pack": "npm run build:prod && npm run check:bundle && evenhub pack app.json dist -o hermes.ehpk",
+    "pack": "npm run build:prod && npm run check:bundle && evenhub pack app.json dist -o Hermes.ehpk",
     "build:diag": "VITE_GLASS_DIAG=1 VITE_HERMES_API_BASE=https://hermes-g2.tail390702.ts.net:8443 npm run build",
-    "pack:diag": "npm run build:diag && evenhub pack app.json dist -o hermes-diag.ehpk",
+    "pack:diag": "npm run build:diag && evenhub pack app.json dist -o Hermes-diag.ehpk",
     "check:bundle": "node scripts/assert-clean-glass-bundle.mjs",
     "simulate": "evenhub-simulator http://localhost:5173",
     "mock-api": "node mock-hermes-api.mjs",

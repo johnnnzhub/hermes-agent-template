@@ -75,14 +75,14 @@ test("migrates the one-field session state without changing its client id", asyn
   }
 });
 
-test("exposes one HERMES session and maps text/history/info to the official provider shape", async (t) => {
+test("exposes one Hermes session and maps text/history/info to the official provider shape", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
 
   const sessions = await harness.provider.listSessions(10);
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, harness.sessionId);
-  assert.equal(sessions[0].title, "HERMES");
+  assert.equal(sessions[0].title, "Hermes");
   assert.equal(sessions[0].provider, "claude");
 
   const info = await harness.provider.getInfo();
@@ -134,14 +134,14 @@ test("exposes one HERMES session and maps text/history/info to the official prov
   assert.ok(messages[resultIndex].durationMs >= 0);
 });
 
-test("keeps the client-visible HERMES title invariant against Hermes title events", async (t) => {
+test("keeps the client-visible Hermes title invariant against Hermes title events", async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
 
   await harness.rpc.request("test.emit_title", { title: "renamed internally" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const [session] = await harness.provider.listSessions(10);
-  assert.equal(session.title, "HERMES");
+  assert.equal(session.title, "Hermes");
 });
 
 test("pins a resumed session without changing its client id or global profile", async () => {
