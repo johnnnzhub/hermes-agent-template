@@ -1,7 +1,7 @@
 import type { HermesTurn } from './glassApi'
 
 const LINE_WIDTH = 43
-const BODY_LINES = 6
+const BODY_LINES = 8
 
 export interface ConversationPage {
   key: string
@@ -54,19 +54,19 @@ export function wrapHudText(value: string, width = LINE_WIDTH): string[] {
 
 function turnLines(turn: HermesTurn): string[] {
   const lines: string[] = []
-  if (turn.user) lines.push('VOCE', ...wrapHudText(turn.user))
+  if (turn.user) lines.push(...wrapHudText(`> ${turn.user}`))
   if (turn.assistant) {
     if (lines.length) lines.push('')
-    lines.push('HERMES', ...wrapHudText(turn.assistant))
+    lines.push(...wrapHudText(turn.assistant))
   } else if (turn.user) {
-    lines.push('', 'HERMES', 'Aguardando resposta...')
+    lines.push('', '...')
   }
   return lines
 }
 
 export function buildConversationPages(turns: HermesTurn[]): ConversationPage[] {
   const pages: ConversationPage[] = []
-  turns.forEach((turn, turnIndex) => {
+  turns.forEach(turn => {
     const lines = turnLines(turn)
     const chunks: string[][] = []
     for (let index = 0; index < Math.max(lines.length, 1); index += BODY_LINES) {
@@ -74,17 +74,19 @@ export function buildConversationPages(turns: HermesTurn[]): ConversationPage[] 
     }
     chunks.forEach((chunk, pageIndex) => {
       const pageCount = chunks.length
-      const header = `HERMES · turno ${turnIndex + 1}/${turns.length} · ${pageIndex + 1}/${pageCount}`
       pages.push({
         key: `${turn.id}:${pageIndex}`,
         turnId: turn.id,
         page: pageIndex,
         pageCount,
-        text: [header, ...chunk, '', 'scroll = histórico · tap = falar'].join('\n'),
+        text: chunk.join('\n'),
       })
     })
   })
-  return pages
+  return pages.map((page, index) => ({
+    ...page,
+    text: [`HERMES · ${index + 1}/${pages.length}`, page.text].filter(Boolean).join('\n'),
+  }))
 }
 
 export function latestTurnFirstPage(pages: ConversationPage[]): number {
@@ -102,4 +104,3 @@ export function mergeOlderTurns(current: HermesTurn[], older: HermesTurn[]): Her
     return true
   })
 }
-

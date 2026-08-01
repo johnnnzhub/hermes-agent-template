@@ -14,15 +14,25 @@ const FORBIDDEN = [
   'buscando tarefas',
   '/glass/task',
   'hermes-production-bfba.up.railway.app',
+  'tap =',
+  'scroll =',
+  '2 toques',
+  'Toque para falar',
+  'dois toques',
+  'Pode fechar',
+  'Transcrevendo e enviando',
+  'HERMES · EXECUTANDO',
+  'VOCE',
+  'turno ',
 ]
 const REQUIRED = [
   'HERMES',
   'OUVINDO',
-  'Transcrevendo e enviando',
+  'PENSANDO',
   '/glass/hermes/session',
   '/glass/hermes/turn',
   'hermes-g2.tail390702.ts.net:8443',
-  'Aguardando no Terminal Mode',
+  'AGUARDANDO NO TERMINAL',
 ]
 
 const envKeys = ['VITE_GLASS_DIAG', 'VITE_HERMES_API_BASE']
