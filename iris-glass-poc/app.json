@@ -1,17 +1,17 @@
 {
   "package_id": "com.cobaiateam.iris.glasses",
   "edition": "202601",
-  "name": "Iris Glass",
-  "version": "0.3.0",
+  "name": "HERMES",
+  "version": "0.4.0",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
-    { "name": "g2-microphone", "desc": "Capturar áudio do G2 para comandos da Iris." },
+    { "name": "g2-microphone", "desc": "Capturar voz para a conversa privada com o HERMES." },
     {
       "name": "network",
-      "desc": "Enviar comandos para a Hermes Glass API.",
-      "whitelist": ["https://hermes-production-bfba.up.railway.app"]
+      "desc": "Acessar a sessão privada do HERMES pela tailnet.",
+      "whitelist": ["https://hermes-g2.tail390702.ts.net:8443"]
     }
   ],
   "supported_languages": ["en"]

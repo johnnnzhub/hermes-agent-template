@@ -71,6 +71,9 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 | `IRIS_TERMINAL_TOKEN` | *(unset)* | CSPRNG-generated client token, at least 32 bytes. Required when Terminal Mode is enabled. |
 | `IRIS_TERMINAL_PORT` | `3456` | Loopback-only HTTP/SSE bridge port. |
 | `IRIS_TERMINAL_TS_PORT` | `8443` | Dedicated tailnet-only HTTPS listener. Port `443` remains reserved for the dashboard. |
+| `GLASS_TOKEN` | *(unset)* | Dedicated Bearer token, at least 32 bytes, for the private HERMES SDK surface only. |
+| `IRIS_GLASS_STT_URL` | `https://n8n.cobaiateam.com.br/webhook/g2-voice` | Existing G2 PCM transcription endpoint used server-side. |
+| `IRIS_GLASS_STT_TOKEN` | *(unset)* | Server-side Bearer token for the G2 transcription endpoint; it is never baked into the plugin. |
 
 All other configuration (LLM provider, model, channels, tools) is managed through the admin dashboard.
 
@@ -98,6 +101,7 @@ Railway Container
 └── Even Terminal bridge (feature-flagged)
     ├── 127.0.0.1:3456 — native HTTP/SSE compatibility API
     ├── python -m tui_gateway.entry — one persistent Hermes session
+    ├── /glass/hermes/* — scoped SDK history + PCM voice turn API
     └── Tailscale Serve :8443 — tailnet-only TLS; Funnel forced off
 ```
 
@@ -143,6 +147,27 @@ remove `IRIS_TERMINAL_TOKEN` separately if credential revocation is required.
 
 Implementation and upstream pin details live in
 [`terminal-mode/UPSTREAM.md`](terminal-mode/UPSTREAM.md).
+
+## HERMES SDK app for Even G2
+
+[`iris-glass-poc/`](iris-glass-poc/) packages a private Even Hub app named
+**HERMES**. It does not create another agent or conversation: both the SDK app
+and Terminal Mode resolve the same single persisted session owned by the
+server. Opening the app loads the latest exchange; scroll navigates paginated
+history, one tap starts recording, and the next tap sends PCM audio. Hermes
+continues the full turn and tool execution server-side even if the app closes.
+
+The SDK token can call only `GET /glass/hermes/session` and
+`POST /glass/hermes/turn`. It cannot select a session, model, provider, working
+directory, invoke arbitrary tools, interrupt a turn, or answer approvals and
+questions. The display receives only conversation text and safe progress such
+as a tool name; arguments, output, logs, secrets, and approval details remain
+on Terminal Mode/admin surfaces. Interactive waits appear as
+`Aguardando no Terminal Mode`.
+
+The app and API are tailnet-only on the existing dedicated `:8443` listener.
+Build the private package with `cd iris-glass-poc && npm run pack`; never
+publish the resulting `.ehpk` or its embedded `GLASS_TOKEN` publicly.
 
 ## Running Locally
 
