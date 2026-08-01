@@ -1,20 +1,52 @@
-// Cliente da Hermes Glass API (v0.3.x): GET /glass/tasks + POST /glass/task.
-// Conversa com a Iris NÃO passa por aqui — é o canal BYOA nativo do Even Hub
-// (decisão da PO; sendIntent/STT removidos na 0.3.0).
-//
-// Padrões portados de projects/apps/g2-fluxo/src/api.ts (battle-tested no G2):
-// fetchWithTimeout (WebView pendura fetch sem rejeitar), retry [0,1s,3s] com
-// clientMsgId ESTÁVEL (dedup no gateway: mesmo id 2× = no-op), 401/403
-// fail-fast 'token' (retry não conserta credencial).
+const SESSION_TIMEOUT_MS = 12_000
+const TURN_TIMEOUT_MS = 35_000
 
-const ACTION_TIMEOUT_MS = 15000
-const TASKS_TIMEOUT_MS = 12000
+export interface HermesTurn {
+  id: string
+  user: string
+  assistant: string
+}
+export interface HermesProgress {
+  kind: 'thinking' | 'tool' | 'answer' | 'awaiting'
+  text: string
+}
 
-class HttpError extends Error {
+export interface HermesSession {
+  ok: true
+  sessionId: string
+  revision: string
+  state: 'idle' | 'busy' | 'awaiting'
+  progress: HermesProgress | null
+  turns: HermesTurn[]
+  cursor: number
+  nextCursor: number | null
+}
+
+export interface VoiceTurnRequest {
+  pcmB64: string
+  sampleRate: number
+  channels: number
+  bitDepth: number
+  clientMsgId: string
+  expectedRevision: string
+}
+
+export interface VoiceTurnAccepted {
+  ok: true
+  sessionId: string
+  clientMsgId: string
+  transcript: string
+}
+
+export class ApiError extends Error {
   status: number
-  constructor(status: number) {
-    super('HTTP ' + status)
+  publicMessage: string
+
+  constructor(status: number, publicMessage: string) {
+    super(publicMessage)
+    this.name = 'ApiError'
     this.status = status
+    this.publicMessage = publicMessage
   }
 }
 
@@ -23,128 +55,144 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), timeoutMs)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    return await fetch(url, { ...init, signal: ctl.signal })
+    return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timer)
   }
 }
 
-function baseUrl(): string | undefined {
-  return (import.meta.env.VITE_GLASS_API_BASE as string | undefined)?.replace(/\/$/, '')
+function baseUrl(): string {
+  const configured = (import.meta.env.VITE_HERMES_API_BASE as string | undefined)?.replace(/\/$/, '')
+  if (!configured) throw new ApiError(0, 'API do HERMES não configurada.')
+  return configured
 }
 
 function authHeaders(): Record<string, string> {
-  return import.meta.env.VITE_GLASS_API_TOKEN
-    ? { authorization: `Bearer ${import.meta.env.VITE_GLASS_API_TOKEN}` }
-    : {}
+  const token = import.meta.env.VITE_GLASS_API_TOKEN as string | undefined
+  return token ? { authorization: `Bearer ${token}` } : {}
+}
+
+async function responseError(response: Response): Promise<ApiError> {
+  let message = ''
+  try {
+    const body = await response.json()
+    if (typeof body?.error === 'string') message = body.error
+  } catch {
+    // Status alone is sufficient when the gateway returned no JSON.
+  }
+  if (response.status === 401 || response.status === 403) {
+    return new ApiError(response.status, 'Token do HERMES inválido.')
+  }
+  if (response.status === 409) {
+    return new ApiError(response.status, message || 'A conversa mudou; atualize e tente novamente.')
+  }
+  if (response.status === 413) return new ApiError(response.status, 'Áudio longo demais.')
+  if (response.status === 422) return new ApiError(response.status, message || 'Não encontrei fala nesse áudio.')
+  return new ApiError(response.status, message || 'Sem conexão com o HERMES.')
+}
+
+function normalizedSession(raw: unknown): HermesSession {
+  if (!raw || typeof raw !== 'object') throw new ApiError(502, 'Resposta inválida do HERMES.')
+  const data = raw as Partial<HermesSession>
+  if (
+    data.ok !== true ||
+    typeof data.sessionId !== 'string' ||
+    !/^[a-f0-9]{16}$/.test(String(data.revision ?? '')) ||
+    !['idle', 'busy', 'awaiting'].includes(String(data.state))
+  ) {
+    throw new ApiError(502, 'Resposta inválida do HERMES.')
+  }
+  const turns = Array.isArray(data.turns)
+    ? data.turns
+        .filter((turn): turn is HermesTurn => Boolean(
+          turn &&
+          typeof turn.id === 'string' &&
+          typeof turn.user === 'string' &&
+          typeof turn.assistant === 'string',
+        ))
+        .slice(0, 10)
+    : []
+  const progress = data.progress &&
+    typeof data.progress.text === 'string' &&
+    ['thinking', 'tool', 'answer', 'awaiting'].includes(data.progress.kind)
+    ? { kind: data.progress.kind, text: data.progress.text.slice(0, 80) }
+    : null
+  return {
+    ok: true,
+    sessionId: data.sessionId,
+    revision: String(data.revision),
+    state: data.state as HermesSession['state'],
+    progress,
+    turns,
+    cursor: Number.isInteger(data.cursor) ? Number(data.cursor) : 0,
+    nextCursor: Number.isInteger(data.nextCursor) ? Number(data.nextCursor) : null,
+  }
 }
 
 export function newMsgId(): string {
-  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-// ── GET /glass/tasks ─────────────────────────────────────────────────────────
-
-export interface GlassTasksResponse {
-  ok: boolean
-  lines: string[]
-  ids: string[]
-  updated_at?: string
-  error?: string
-}
-
-export async function fetchGlassTasks(limit = 5): Promise<GlassTasksResponse> {
-  const base = baseUrl()
-
-  // Fallback mock (dev/browser sem API): mantém o plugin testável offline.
-  if (!base) {
-    return {
-      ok: true,
-      lines: ['» Mock: preparar posts', '» Mock: revisar lista', '» Mock: validar G2'],
-      ids: ['mock-1', 'mock-2', 'mock-3'],
+export async function fetchHermesSession(cursor = 0): Promise<HermesSession> {
+  let lastError: unknown
+  for (const delay of [0, 700]) {
+    if (delay) await sleep(delay)
+    try {
+      const response = await fetchWithTimeout(
+        `${baseUrl()}/glass/hermes/session?cursor=${cursor}&limit=6`,
+        { headers: authHeaders() },
+        SESSION_TIMEOUT_MS,
+      )
+      if (!response.ok) throw await responseError(response)
+      return normalizedSession(await response.json())
+    } catch (error) {
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) throw error
+      lastError = error
     }
   }
-
-  const res = await fetchWithTimeout(
-    `${base}/glass/tasks?scope=next&limit=${limit}`,
-    { headers: authHeaders() },
-    TASKS_TIMEOUT_MS,
-  )
-  if (!res.ok) throw new HttpError(res.status)
-  return normalizeTasks(await res.json())
+  if (lastError instanceof ApiError) throw lastError
+  throw new ApiError(0, 'Sem conexão com o HERMES.')
 }
 
-function normalizeTasks(raw: unknown): GlassTasksResponse {
-  if (!raw || typeof raw !== 'object') {
-    return { ok: false, lines: [], ids: [], error: 'resposta inválida' }
-  }
-  const data = raw as Partial<GlassTasksResponse>
-  const lines = Array.isArray(data.lines)
-    ? data.lines.filter((l): l is string => typeof l === 'string').slice(0, 6)
-    : []
-  const ids = Array.isArray(data.ids) ? data.ids.map(String).slice(0, lines.length) : []
-  return {
-    ok: Boolean(data.ok),
-    lines,
-    ids,
-    updated_at: typeof data.updated_at === 'string' ? data.updated_at : undefined,
-    error: typeof data.error === 'string' ? data.error : undefined,
-  }
-}
-
-// ── POST /glass/task (done/snooze) ───────────────────────────────────────────
-
-export interface ActionResult {
-  ok: boolean
-  already?: boolean
-  gone?: boolean
-  error?: string
-}
-
-async function postAction(body: Record<string, unknown>): Promise<ActionResult> {
-  const base = baseUrl()
-  if (!base) return { ok: true } // mock offline: sucesso simulado
-
-  const payload = JSON.stringify(body)
-  const delays = [0, 1000, 3000]
-  let lastErr = ''
-  for (const d of delays) {
-    if (d) await sleep(d)
+export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTurnAccepted> {
+  const payload = JSON.stringify(request)
+  let lastError: unknown
+  for (const delay of [0, 1_000, 3_000]) {
+    if (delay) await sleep(delay)
     try {
-      const res = await fetchWithTimeout(
-        `${base}/glass/task`,
+      const response = await fetchWithTimeout(
+        `${baseUrl()}/glass/hermes/turn`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json', ...authHeaders() },
+          headers: { ...authHeaders(), 'content-type': 'application/json' },
           body: payload,
         },
-        ACTION_TIMEOUT_MS,
+        TURN_TIMEOUT_MS,
       )
-      if (!res.ok) throw new HttpError(res.status)
-      const out = await res.json()
+      if (!response.ok) throw await responseError(response)
+      const body = await response.json()
+      if (
+        body?.ok !== true ||
+        typeof body.sessionId !== 'string' ||
+        typeof body.clientMsgId !== 'string' ||
+        typeof body.transcript !== 'string'
+      ) {
+        throw new ApiError(502, 'Resposta inválida do HERMES.')
+      }
       return {
-        ok: out?.ok === true,
-        already: out?.already === true,
-        gone: out?.gone === true,
-        error: typeof out?.error === 'string' ? out.error : undefined,
+        ok: true,
+        sessionId: body.sessionId,
+        clientMsgId: body.clientMsgId,
+        transcript: body.transcript,
       }
-    } catch (e) {
-      if (e instanceof HttpError && (e.status === 401 || e.status === 403)) {
-        return { ok: false, error: 'token' }
-      }
-      lastErr = (e as Error).message || 'falha'
+    } catch (error) {
+      if (error instanceof ApiError && error.status >= 400 && error.status < 500) throw error
+      lastError = error
     }
   }
-  return { ok: false, error: lastErr }
-}
-
-export function taskDone(taskId: string, clientMsgId: string): Promise<ActionResult> {
-  return postAction({ action: 'task.done', taskId, clientMsgId })
-}
-
-export function taskSnooze(taskId: string, clientMsgId: string): Promise<ActionResult> {
-  return postAction({ action: 'task.snooze', taskId, clientMsgId })
+  if (lastError instanceof ApiError) throw lastError
+  throw new ApiError(0, 'Não consegui enviar a mensagem.')
 }

@@ -9,6 +9,10 @@ import {
   providerWireName,
 } from "./hermes-provider.mjs";
 import { HermesRpcClient } from "./rpc-client.mjs";
+import {
+  createGlassConversationRouter,
+  GlassTranscriber,
+} from "./glass-conversation.mjs";
 
 const UPSTREAM_PACKAGE = "@evenrealities/even-terminal";
 const UPSTREAM_VERSION = "0.8.1";
@@ -118,6 +122,8 @@ export function createApp({
   provider,
   events,
   token,
+  glassToken,
+  glassTranscriber,
   logger = consoleLogger,
   now = () => new Date(),
 }) {
@@ -140,6 +146,18 @@ export function createApp({
     }
     next();
   });
+  if (glassToken) {
+    app.use(
+      "/glass/hermes",
+      createGlassConversationRouter({
+        provider,
+        events,
+        token: glassToken,
+        transcriber: glassTranscriber,
+        logger,
+      }),
+    );
+  }
   app.use(express.json({ limit: "64kb" }));
 
   app.get("/healthz", (_req, res) => {
@@ -368,6 +386,8 @@ export async function startTerminalServer({
     10,
   ),
   token = process.env.IRIS_TERMINAL_TOKEN,
+  glassToken = process.env.GLASS_TOKEN,
+  glassTranscriber,
   hermesHome = process.env.HERMES_HOME,
   logger = consoleLogger,
   rpc,
@@ -398,6 +418,9 @@ export async function startTerminalServer({
     provider: hermesProvider,
     events: eventBuffer,
     token,
+    glassToken,
+    glassTranscriber:
+      glassTranscriber ?? (glassToken ? new GlassTranscriber() : undefined),
     logger,
   });
 

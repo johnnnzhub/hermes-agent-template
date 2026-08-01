@@ -250,7 +250,7 @@ export class HermesProvider {
         text: messageText(message),
       }))
       .filter((message) => message.text)
-      .slice(-Math.min(Math.max(Number(limit) || 10, 1), 10));
+      .slice(-Math.min(Math.max(Number(limit) || 10, 1), 50));
   }
 
   async prompt(sessionId, text) {

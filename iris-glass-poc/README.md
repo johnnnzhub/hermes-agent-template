@@ -1,56 +1,68 @@
-# asr
+# HERMES for Even G2
 
-Live speech-to-text demo on G2. Mic audio → your chosen STT provider → transcript rendered on the glasses and mirrored in the companion WebView. Includes double-tap-to-exit wiring.
+Private Even Hub SDK app for the existing Iris/Hermes conversation. It shares
+the exact persistent session already used by Even Terminal Mode; there is no
+second agent, model profile, memory, or conversation.
 
-**The STT client itself is a blank stub.** This template has zero vendor code baked in. You pick your own provider (Deepgram, AssemblyAI, Whisper, Soniox, self-hosted, etc.) and wire it up in `src/asr/stt.ts`.
+## Interaction
 
-## Run
+- Open: latest user/Hermes exchange, starting at its first page.
+- Scroll: older/newer pages and turns; older history loads on demand.
+- Tap: start PCM 16 kHz mono recording.
+- Tap again: stop, transcribe server-side, and submit to the same session.
+- Double tap: stop the microphone and exit.
+- Close while busy: Hermes continues; reopening shows current progress or the
+  completed answer.
+
+The display exposes conversation text plus safe progress (`Pensando`,
+`Usando <ferramenta>`, or `Aguardando no Terminal Mode`). Tool arguments,
+outputs, logs, secrets, questions, and approval details are never returned by
+the SDK routes.
+
+## Configuration
 
 ```bash
-cp .env.example .env.local   # paste your STT provider's API key into VITE_STT_API_KEY
+cp .env.example .env.local
+# Set VITE_GLASS_API_TOKEN to the dedicated GLASS_TOKEN.
 npm install
-npm run dev
 ```
 
-Then `npm run simulate` (desktop simulator) or `npx evenhub qr --url http://<your-ip>:5173` to test on real glasses.
+`npm run build:prod` fixes the API base to the tailnet-only endpoint
+`https://hermes-g2.tail390702.ts.net:8443`. The STT credential remains on the
+server as `IRIS_GLASS_STT_TOKEN`; it is not present in the plugin.
 
-## First-run expectation
+## Validate and package
 
-Until you implement `src/asr/stt.ts`, the companion WebView shows a red error chip: *"STT provider not implemented — open src/asr/stt.ts and wire up your chosen STT service."* That's by design — the scaffold compiles and runs, but the STT handoff throws on startup so you know exactly where to go.
+```bash
+npm test
+npm run build:smoke
+npm run pack
+```
 
-## What's in here
+`npm run pack` type-checks, builds the production bundle, rejects diagnostic,
+task-era, localhost, and public-Railway strings, then writes `hermes.ehpk`.
+This artifact contains the dedicated Glass credential and is for private/beta
+installation only.
 
-| File | Purpose |
+## Local companion preview
+
+```bash
+GLASS_TOKEN=dev-token npm run mock-api
+VITE_HERMES_API_BASE=http://127.0.0.1:8797 \
+VITE_GLASS_API_TOKEN=dev-token npm run dev
+```
+
+The real glasses path still requires the Even Hub companion app and a phone on
+the same tailnet. Build/tests do not count as microphone, gesture, rendering,
+or reconnect validation on physical G2 hardware.
+
+## Source map
+
+| File | Responsibility |
 |---|---|
-| `src/main.ts` | App entry. Creates the transcript container, starts the mic, routes PCM chunks to `stt.ts`, renders snapshots with a 120ms debounce, handles double-tap exit. |
-| `src/asr/stt.ts` | **Blank stub.** Provider-agnostic `SttClient` interface + `startSttStream()` function. Implement your STT provider here. |
-| `src/ui.ts` | Companion-app UI — status chip, live transcript mirror, dark theme. |
-| `index.html` | WebView host with zoom-locked viewport. |
-| `app.json` | Manifest with `g2-microphone` permission. **No `network` permission by default** — add yours when you pick a provider. |
-| `.env.example` | `VITE_STT_API_KEY=` placeholder for your provider's key. |
-
-## Wiring your STT provider
-
-1. Open `src/asr/stt.ts`. Replace the `throw` inside `startSttStream` with your provider's logic:
-   - Connect to the provider (WebSocket for streaming, HTTP for batch).
-   - Send the authentication / session-start message.
-   - On each inbound transcript message, build a `SttSnapshot { finalText, interimText, finished }` and call `onSnapshot()`.
-   - Implement `sendPcm(chunk)` to forward each mic chunk. The input is PCM s16le @ 16 kHz, mono — most providers accept this directly; resample if yours doesn't.
-   - Implement `close()` to signal end-of-stream.
-
-2. Paste your API key into `.env.local` as `VITE_STT_API_KEY=...`.
-
-3. Add a `network` permission to `app.json` with your provider's hosts:
-
-   ```json
-   { "name": "network", "desc": "Stream audio to STT.", "whitelist": ["https://api.yourprovider.com", "wss://stream.yourprovider.com"] }
-   ```
-
-   `evenhub pack` rejects an empty whitelist, which is why this entry isn't in `app.json` by default.
-
-## G2 specifics
-
-- Mic format: PCM s16le, 16 kHz, mono. Delivered via `event.audioEvent.audioPcm` as `Uint8Array`.
-- Glasses render is debounced to 120 ms — the BLE queue can't keep up with per-token writes.
-- Transcript is trimmed to the last 240 characters to fit the 576x288 text container at default font.
-- **Double-tap the temple** → `shutDownPageContainer(1)` → system exit confirmation dialog.
+| `src/main.ts` | G2 lifecycle, gestures, serialized full-container renders, polling, and voice flow. |
+| `src/glassApi.ts` | Scoped authenticated API client with stable retry IDs and timeouts. |
+| `src/conversation.ts` | Pure history wrapping, pagination, and merge logic. |
+| `src/voice.ts` | Proven PCM normalization, RMS silence gate, mic timeout, and cleanup. |
+| `src/glassEvents.ts` | Firmware event normalization and duplicate-safe gesture classification. |
+| `scripts/assert-clean-glass-bundle.mjs` | Production bundle privacy/contract gate. |
