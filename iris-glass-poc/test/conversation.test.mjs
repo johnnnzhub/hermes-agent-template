@@ -30,7 +30,9 @@ test('builds paged turns and opens at the first page of the latest turn', () => 
   assert.equal(pages[index].turnId, 'latest')
   assert.equal(pages[index].page, 0)
   assert.ok(pages.filter(page => page.turnId === 'latest').length > 1)
-  assert.match(pages[index].text, /scroll = histórico · tap = falar/)
+  assert.match(pages[index].text, /^HERMES · \d+\/\d+/)
+  assert.match(pages[index].text, /> Pergunta nova/)
+  assert.doesNotMatch(pages[index].text, /tap|scroll|VOCE|turno/)
 })
 
 test('prepends older history without duplicating turns already loaded', () => {
@@ -46,4 +48,3 @@ test('prepends older history without duplicating turns already loaded', () => {
   )
   assert.deepEqual(result.map(turn => turn.id), ['one', 'two', 'three'])
 })
-

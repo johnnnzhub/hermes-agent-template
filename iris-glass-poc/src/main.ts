@@ -35,8 +35,8 @@ mountUi()
 
 const IS_DIAG = (import.meta.env.VITE_GLASS_DIAG as string | undefined) === '1'
 const INITIAL_TEXT = IS_DIAG
-  ? `HERMES DIAG v${__APP_VERSION__} · conectando...`
-  : `HERMES v${__APP_VERSION__} · conectando...`
+  ? `HERMES DIAG · v${__APP_VERSION__}`
+  : `HERMES · v${__APP_VERSION__}`
 const RECORDING_LIMIT_MS = 30_000
 const POLL_MS = 1_200
 
@@ -118,7 +118,6 @@ let turns: HermesTurn[] = []
 let pages: ConversationPage[] = []
 let pageIndex = 0
 let nextCursor: number | null = null
-let lastTranscript = ''
 let notice = ''
 let noticeTimer: number | null = null
 let recordingTimer: number | null = null
@@ -128,43 +127,23 @@ let sending = false
 let loadingOlder = false
 let micStarting = false
 
-function latestUser(): string {
-  return lastTranscript || turns.at(-1)?.user || ''
-}
-
 function workingContent(): string {
-  const status = progress?.text || (remoteState === 'awaiting' ? 'Aguardando no Terminal Mode' : 'Pensando')
-  const question = latestUser()
-  const questionLines = question ? question.replace(/\s+/g, ' ').trim().match(/.{1,43}(?:\s|$)|.{1,43}/g) ?? [] : []
-  return [
-    'HERMES · EXECUTANDO',
-    status,
-    '',
-    ...(questionLines.length ? ['VOCE', ...questionLines.slice(0, 3)] : []),
-    '',
-    'Pode fechar: a execução continua.',
-  ].join('\n')
+  if (remoteState === 'awaiting' || progress?.kind === 'awaiting') {
+    return 'AGUARDANDO NO TERMINAL'
+  }
+  if (progress?.kind === 'tool') return progress.text.toUpperCase()
+  return 'PENSANDO'
 }
 
 function emptyContent(): string {
-  return [
-    `HERMES v${__APP_VERSION__}`,
-    'Nenhuma conversa ainda.',
-    '',
-    'tap = falar',
-    '2 toques = sair',
-  ].join('\n')
+  return 'HERMES'
 }
 
 function contentForState(): string {
   if (mode === 'loading') return INITIAL_TEXT
-  if (mode === 'recording') {
-    return ['HERMES · OUVINDO', '', 'tap = enviar', '2 toques = sair'].join('\n')
-  }
-  if (mode === 'sending') return ['HERMES', '', 'Transcrevendo e enviando...'].join('\n')
-  if (mode === 'error') {
-    return ['HERMES', '', notice || 'Não foi possível continuar.', '', 'tap = tentar novamente'].join('\n')
-  }
+  if (mode === 'recording') return 'OUVINDO'
+  if (mode === 'sending') return 'PENSANDO'
+  if (mode === 'error') return notice || 'NÃO FOI POSSÍVEL CONTINUAR'
   if (remoteState !== 'idle') return workingContent()
   if (!pages.length) return emptyContent()
   return pages[Math.min(pageIndex, pages.length - 1)].text
@@ -203,7 +182,6 @@ function applySession(snapshot: HermesSession, focusLatest: boolean) {
   remoteState = snapshot.state
   progress = snapshot.progress
   turns = snapshot.turns
-  lastTranscript = turns.at(-1)?.user || ''
   nextCursor = snapshot.nextCursor
   pages = buildConversationPages(turns)
   if (focusLatest) pageIndex = latestTurnFirstPage(pages)
@@ -315,7 +293,7 @@ async function finishRecording() {
       return
     }
     const clientMsgId = newMsgId()
-    const accepted = await sendVoiceTurn({
+    await sendVoiceTurn({
       pcmB64: bytesToB64(pcm),
       sampleRate: AUDIO_SR,
       channels: 1,
@@ -323,7 +301,6 @@ async function finishRecording() {
       clientMsgId,
       expectedRevision: revision,
     })
-    lastTranscript = accepted.transcript
     remoteState = 'busy'
     progress = { kind: 'thinking', text: 'Pensando' }
     mode = 'history'

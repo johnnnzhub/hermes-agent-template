@@ -12,7 +12,6 @@ export function mountUi() {
         <div id="status" class="status status-connecting">Conectando</div>
       </header>
       <pre id="preview" class="preview" aria-live="polite"></pre>
-      <footer>Toque para falar · dois toques para sair</footer>
     </main>
   `
   statusEl = app.querySelector<HTMLDivElement>('#status')!
@@ -48,7 +47,6 @@ function injectStyles() {
     .preview { flex: 1; overflow: auto; background: #2E2E2E; border: 1px solid #3E3E3E;
       border-radius: 12px; padding: 20px; font: 16px/1.45 ui-monospace, SFMono-Regular, monospace;
       white-space: pre-wrap; word-break: break-word; margin: 0; }
-    footer { font-size: 12px; color: #7B7B7B; text-align: center; }
   `
   const style = document.createElement('style')
   style.textContent = css
