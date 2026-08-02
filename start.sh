@@ -1,6 +1,29 @@
 #!/bin/bash
 set -e
 
+# BEGIN IRIS SESSION CREDENTIAL UMASK
+# Baileys writes the WhatsApp auth state with a plain fs.writeFile, so every
+# session file inherits the process umask. This container runs everything as
+# root with the default 0022, which is why all 3460 live session files (2607
+# Iris + 853 Foxy) sit at 0644. Measured 2026-08-02: ctime == mtime on every
+# single one of them, so they were never chmod'ed away from 0600 -- they are
+# simply born that way.
+#
+# Practical exposure today is nil: the session directories are 0700 and root is
+# the only UID in the container, and root ignores permission bits anyway. This
+# is defence in depth -- private key material should not carry group/other read
+# on the inode itself.
+#
+# Setting it here instead of inside the bridge is deliberate. bridge.js lives in
+# /opt/hermes-agent, which the image replaces on every upgrade; patching it
+# would mean a 13th volume patcher right after the inventory of 12 was frozen
+# and proven by the gate. start.sh is the wrapper, it is versioned, and the
+# umask is inherited by every child process -- bridge included.
+#
+# Applies only to files created from here on. Files that already exist need one
+# normalization pass after this ships.
+umask 0077
+# END IRIS SESSION CREDENTIAL UMASK
 
 # BEGIN IRIS RAILWAY ALLOCATOR TUNING
 # Reduce per-thread glibc arena fragmentation in the multithreaded Hermes
