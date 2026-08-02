@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
+import os
+# Raizes parametrizaveis: sem isso este patcher so roda dentro do container, que
+# e exatamente onde nao se quer descobrir que ele parou de casar com o upstream.
+# Com elas, o harness aponta para copias descartaveis de 0.18.2 e 0.19.1 e mede
+# efeito real -- arquivos alterados, idempotencia, sintaxe, pos-condicao.
+CORE = Path(os.environ.get("IRIS_CORE_ROOT", "/opt/hermes-agent"))
+APP = Path(os.environ.get("IRIS_APP_ROOT", "/app"))
+
 # Keep cron deliveries clean by default even if config cannot be read during startup.
-config_py = Path('/opt/hermes-agent/hermes_cli/config.py')
+config_py = CORE / 'hermes_cli/config.py'
 if config_py.exists():
     text = config_py.read_text()
     text2 = text.replace('"wrap_response": True', '"wrap_response": False')
@@ -12,7 +20,7 @@ if config_py.exists():
         config_py.write_text(text2)
         print('patched Hermes config defaults')
 
-scheduler = Path('/opt/hermes-agent/cron/scheduler.py')
+scheduler = CORE / 'cron/scheduler.py'
 if scheduler.exists():
     text = scheduler.read_text()
     text2 = text.replace('    wrap_response = True\n', '    wrap_response = False\n')
@@ -23,7 +31,7 @@ if scheduler.exists():
         print('patched cron scheduler wrap_response default false')
 
 # Belt-and-suspenders: if a future config misses the key, don't replay the Codex notice.
-agent_init = Path('/opt/hermes-agent/agent/agent_init.py')
+agent_init = CORE / 'agent/agent_init.py'
 if agent_init.exists():
     text = agent_init.read_text()
     text2 = text
@@ -51,7 +59,7 @@ if agent_init.exists():
         agent_init.write_text(text2)
         print('patched Codex gpt55 notice suppression')
 
-conversation_compression = Path('/opt/hermes-agent/agent/conversation_compression.py')
+conversation_compression = CORE / 'agent/conversation_compression.py'
 if conversation_compression.exists():
     text = conversation_compression.read_text()
     text2 = text
@@ -84,7 +92,7 @@ if conversation_compression.exists():
         print('patched compression notice suppression')
 
 # Keep the Railway admin server aligned with Iris ops preferences and the G2 API.
-server = Path('/app/server.py')
+server = APP / 'server.py'
 if server.exists():
     text = server.read_text()
     changed = False
@@ -191,9 +199,32 @@ async def route_glass_tasks(request: Request) -> Response:
     if not _glass_authorized(request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401, headers=_GLASS_CORS)
 '''
-    if auth_block in text:
-        text = text.replace(auth_block, auth_new, 1)
+    # Atomico e de uma vez so. Duas coisas estavam erradas aqui:
+    #
+    # 1. A substituicao rodava sem exigir que _glass_authorized existisse. A
+    #    definicao so entra junto com cors_new, acima, e cors_old parou de casar
+    #    quando o _GLASS_CORS do server.py ganhou "GET,POST,OPTIONS". Resultado:
+    #    o arquivo ficava com a CHAMADA e sem a FUNCAO -> NameError -> GET
+    #    /glass/tasks respondendo 500 em producao de 2026-07-13 a 2026-08-02.
+    #
+    # 2. Substituia UMA ocorrencia por execucao. Como isto roda a cada boot, o
+    #    segundo boot convertia a segunda rota e o arquivo mudava de novo --
+    #    nao-idempotente, e cada passagem espalhava mais uma chamada sem
+    #    definicao. Reproduzido do zero contra a arvore limpa: passagem 1
+    #    deixava a chamada na linha 1645, passagem 2 acrescentava a 1701, e
+    #    nenhuma das duas tinha a definicao.
+    #
+    # Agora: so troca se a funcao existir (ja no arquivo ou inserida por
+    # cors_new nesta mesma execucao), e troca todas as ocorrencias juntas.
+    tem_definicao = 'def _glass_authorized(' in text
+    if auth_block in text and tem_definicao:
+        text = text.replace(auth_block, auth_new)
         changed = True
+    elif auth_block in text:
+        print(
+            'glass auth: _glass_authorized ausente, substituicao NAO aplicada '
+            '(trocar aqui produziria NameError em runtime)'
+        )
 
     route_needle = '    Route("/glass/tasks",                       route_glass_tasks,   methods=["GET", "OPTIONS"]),\n'
     route_insert = '    Route("/glass/health",                      route_glass_health,  methods=["GET", "OPTIONS"]),\n    Route("/glass/tasks",                       route_glass_tasks,   methods=["GET", "OPTIONS"]),\n    Route("/glass/intent",                      route_glass_intent,  methods=["POST", "OPTIONS"]),\n'
@@ -216,13 +247,47 @@ async def route_glass_tasks(request: Request) -> Response:
         changed = True
 
     if changed:
+        # Pos-condicao: falhar FECHADO. Este patcher ja gravou uma vez um
+        # server.py que compilava e quebrava em runtime; sintaxe valida nao
+        # basta como criterio. Nenhuma chamada pode apontar para nome que o
+        # modulo nao define.
+        import ast as _ast
+        import builtins as _builtins
+
+        _arvore = _ast.parse(text)
+        _definidos = {
+            n.name for n in _ast.walk(_arvore)
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
+        }
+        for _n in _ast.walk(_arvore):
+            if isinstance(_n, _ast.Import):
+                _definidos.update(a.asname or a.name.split('.')[0] for a in _n.names)
+            elif isinstance(_n, _ast.ImportFrom):
+                _definidos.update(a.asname or a.name for a in _n.names)
+            elif isinstance(_n, _ast.Name) and isinstance(_n.ctx, (_ast.Store, _ast.Del)):
+                _definidos.add(_n.id)
+            elif isinstance(_n, _ast.arg):
+                _definidos.add(_n.arg)
+            elif isinstance(_n, _ast.Global):
+                _definidos.update(_n.names)
+        _conhecidos = _definidos | set(dir(_builtins))
+        _orfas = sorted({
+            (_n.lineno, _n.func.id) for _n in _ast.walk(_arvore)
+            if isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name)
+            and _n.func.id not in _conhecidos
+        })
+        if _orfas:
+            raise RuntimeError(
+                'server patch abortado, chamada a nome nao definido: '
+                + ', '.join(f'{nome} (linha {linha})' for linha, nome in _orfas)
+            )
         server.write_text(text)
         print('patched Railway server Iris ops/G2 routes')
 
 # Codex supports max through Hermes' transport mapping. Do not enable ultra:
 # a live Codex canary returned HTTP 400 for reasoning.effort=ultra.
 reasoning_patches = {
-    Path('/opt/hermes-agent/hermes_constants.py'): [
+    CORE / 'hermes_constants.py': [
         (
             'VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")',
             'VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")',
@@ -232,19 +297,19 @@ reasoning_patches = {
             'Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".',
         ),
     ],
-    Path('/opt/hermes-agent/gateway/run.py'): [
+    CORE / 'gateway/run.py': [
         (
             '"minimal", "low", "medium", "high", "xhigh", "max". Returns None to use',
             '"minimal", "low", "medium", "high", "xhigh", "max". Returns None to use',
         ),
     ],
-    Path('/opt/hermes-agent/gateway/slash_commands.py'): [
+    CORE / 'gateway/slash_commands.py': [
         (
             'elif effort in {"minimal", "low", "medium", "high", "xhigh"}:',
             'elif effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:',
         ),
     ],
-    Path('/opt/hermes-agent/hermes_cli/cli_commands_mixin.py'): [
+    CORE / 'hermes_cli/cli_commands_mixin.py': [
         (
             'Set reasoning effort (none, minimal, low, medium, high, xhigh)',
             'Set reasoning effort (none, minimal, low, medium, high, xhigh, max)',
@@ -254,13 +319,13 @@ reasoning_patches = {
             '<none|minimal|low|medium|high|xhigh|max|show|hide|full|clamp>',
         ),
     ],
-    Path('/opt/hermes-agent/batch_runner.py'): [
+    CORE / 'batch_runner.py': [
         (
             '["none", "minimal", "low", "medium", "high", "xhigh", "max"]',
             '["none", "minimal", "low", "medium", "high", "xhigh", "max"]',
         ),
     ],
-    Path('/opt/hermes-agent/hermes_cli/config.py'): [
+    CORE / 'hermes_cli/config.py': [
         (
             '# reasoning effort for subagents: "xhigh", "high", "medium",',
             '# reasoning effort for subagents: "max", "xhigh", "high", "medium",',

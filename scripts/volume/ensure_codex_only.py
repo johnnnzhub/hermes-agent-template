@@ -8,6 +8,13 @@ from pathlib import Path
 
 import yaml
 
+# Raizes parametrizaveis: sem isso este patcher so roda dentro do container, que
+# e exatamente onde nao se quer descobrir que ele parou de casar com o upstream.
+# Com elas, o harness aponta para copias descartaveis de 0.18.2 e 0.19.1 e mede
+# efeito real -- arquivos alterados, idempotencia, sintaxe, pos-condicao.
+CORE = Path(os.environ.get("IRIS_CORE_ROOT", "/opt/hermes-agent"))
+APP = Path(os.environ.get("IRIS_APP_ROOT", "/app"))
+
 MAIN_MODEL = "gpt-5.6-terra"
 COMPLEX_MODEL = "gpt-5.6-sol"
 PROVIDER = "openai-codex"
@@ -133,7 +140,7 @@ def _write_if_changed(path: Path) -> bool:
 def main() -> int:
     hermes_home = Path(os.environ.get("HERMES_HOME", "/data/.hermes"))
     targets = [hermes_home / "config.yaml"]
-    deploy_config = Path("/app/deploy-config.yaml")
+    deploy_config = APP / "deploy-config.yaml"
     if deploy_config.exists():
         targets.append(deploy_config)
 

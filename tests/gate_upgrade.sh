@@ -62,25 +62,41 @@ import json, pathlib, sys
 atual = json.loads(pathlib.Path(sys.argv[1]).read_text())
 alvo = json.loads(pathlib.Path(sys.argv[2]).read_text())
 
-regressoes, preexistentes, ok = [], [], []
+# Severidade, do melhor para o pior. Comparar so GREEN contra nao-GREEN deixava
+# passar piora entre dois estados ruins -- foi assim que a segunda regressao do
+# bump (model_routing indo de NAO-IDEMPOTENTE para RED) quase escapou.
+SEVERIDADE = {"GREEN": 0, "RED-NAO-IDEMPOTENTE": 1, "RED-FALSO-VERDE": 2, "RED": 3}
+
+regressoes, preexistentes, incomparaveis = [], [], []
 for nome in sorted(atual):
     a, b = atual[nome]["veredito"], alvo.get(nome, {}).get("veredito", "AUSENTE")
-    if a == "GREEN" and b != "GREEN":
+    sa, sb = SEVERIDADE.get(a), SEVERIDADE.get(b)
+    if sa is None or sb is None:
+        # INCONCLUSIVO, ESTATICO, N-A: estado desconhecido, nao da para comparar.
+        # Some do veredito de propositio, e listado a parte -- transformar
+        # "nao sei" em verde ou vermelho seria inventar evidencia.
+        incomparaveis.append((nome, a, b))
+    elif sb > sa:
         regressoes.append((nome, a, b, alvo[nome].get("saida", "")[-300:]))
-    elif a.startswith("RED"):
+    elif sa > 0:
         preexistentes.append((nome, a))
-    else:
-        ok.append((nome, a, b))
 
+nomes_regredidos = {n for n, *_ in regressoes}
 print(f"{'patcher':<46}{'atual':<22}{'alvo':<22}")
 print("-" * 92)
 for nome in sorted(atual):
     a = atual[nome]["veredito"]
     b = alvo.get(nome, {}).get("veredito", "AUSENTE")
-    marca = "  <== REGRESSAO" if (a == "GREEN" and b != "GREEN") else ""
+    marca = "  <== REGRESSAO" if nome in nomes_regredidos else ""
     print(f"{nome:<46}{a:<22}{b:<22}{marca}")
 
 print()
+if incomparaveis:
+    print("SEM VEREDITO (estado desconhecido, nao conta como verde nem vermelho):")
+    for nome, a, b in incomparaveis:
+        print(f"  - {nome}: {a} / {b}")
+    print()
+
 if preexistentes:
     print("PRE-EXISTENTES (nao barram o release, entram como baseline assinado):")
     for nome, a in preexistentes:

@@ -23,7 +23,15 @@ import pathlib
 import sys
 
 RAIZ = pathlib.Path(__file__).resolve().parent.parent
-ALVOS = ["server.py", "hostproxy.py"]
+
+# Wrapper + toda a camada de patch do volume. Os patchers entraram aqui depois
+# que uma parametrizacao de caminho trocou `Path` por `pathlib.Path` sem o
+# import correspondente: o arquivo continuou compilando e so quebraria em
+# runtime, dentro do container, no boot. Mesma classe de falha do
+# _glass_authorized -- por isso a checagem cobre os dois lados.
+ALVOS = ["server.py", "hostproxy.py"] + [
+    str(p.relative_to(RAIZ)) for p in sorted((RAIZ / "scripts" / "volume").glob("*.py"))
+]
 
 
 def nomes_definidos(arvore: ast.AST) -> set[str]:
@@ -49,14 +57,42 @@ def nomes_definidos(arvore: ast.AST) -> set[str]:
     return definidos
 
 
+def _raiz_do_alvo(func: ast.expr) -> tuple[str, str] | None:
+    """Nome-raiz de um alvo de chamada, e como ele aparece escrito.
+
+    `foo()`            -> ("foo", "foo")
+    `pathlib.Path()`   -> ("pathlib", "pathlib.Path")
+
+    A segunda forma existe porque a primeira versao deste teste so olhava
+    `ast.Name` e passava batido por `pathlib.Path(...)` num arquivo que tinha
+    apenas `from pathlib import Path`. O bug foi introduzido de verdade durante
+    a parametrizacao dos patchers e o teste deu verde -- foi a tentativa de
+    provar o vermelho que revelou o buraco.
+    """
+    if isinstance(func, ast.Name):
+        return func.id, func.id
+    if isinstance(func, ast.Attribute):
+        partes = []
+        no: ast.expr = func
+        while isinstance(no, ast.Attribute):
+            partes.append(no.attr)
+            no = no.value
+        if isinstance(no, ast.Name):
+            partes.append(no.id)
+            return no.id, ".".join(reversed(partes))
+    return None
+
+
 def chamadas_indefinidas(caminho: pathlib.Path) -> list[tuple[int, str]]:
     arvore = ast.parse(caminho.read_text(errors="replace"), filename=str(caminho))
     conhecidos = nomes_definidos(arvore) | set(dir(builtins))
     faltando = []
     for no in ast.walk(arvore):
-        if isinstance(no, ast.Call) and isinstance(no.func, ast.Name):
-            if no.func.id not in conhecidos:
-                faltando.append((no.lineno, no.func.id))
+        if not isinstance(no, ast.Call):
+            continue
+        alvo = _raiz_do_alvo(no.func)
+        if alvo and alvo[0] not in conhecidos:
+            faltando.append((no.lineno, alvo[1]))
     return sorted(set(faltando))
 
 

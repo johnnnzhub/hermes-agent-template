@@ -10,9 +10,17 @@ import shutil
 import sys
 from pathlib import Path
 
-SOURCE = Path("/data/.hermes/scripts/iris_model_router.py")
-TARGET = Path("/opt/hermes-agent/iris_model_router.py")
-GATEWAY = Path("/opt/hermes-agent/gateway/run.py")
+import os
+# Raizes parametrizaveis: sem isso este patcher so roda dentro do container, que
+# e exatamente onde nao se quer descobrir que ele parou de casar com o upstream.
+# Com elas, o harness aponta para copias descartaveis de 0.18.2 e 0.19.1 e mede
+# efeito real -- arquivos alterados, idempotencia, sintaxe, pos-condicao.
+CORE = Path(os.environ.get("IRIS_CORE_ROOT", "/opt/hermes-agent"))
+APP = Path(os.environ.get("IRIS_APP_ROOT", "/app"))
+
+SOURCE = Path(os.environ.get("IRIS_ROUTER_SOURCE", "/data/.hermes/scripts")) / "iris_model_router.py"
+TARGET = CORE / "iris_model_router.py"
+GATEWAY = CORE / "gateway/run.py"
 
 IMPORT = "        from hermes_cli.models import resolve_fast_mode_overrides\n"
 IMPORT_NEW = IMPORT + "        from iris_model_router import route_turn as _iris_route_turn\n"

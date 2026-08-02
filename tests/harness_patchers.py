@@ -64,6 +64,23 @@ ISOLAVEIS = {
     "ensure_persistent_mcp_binaries.py": lambda c, w: {
         "IRIS_MCP_CONFIG_PATHS": str(w / "deploy-config.yaml"),
     },
+    # Parametrizados em 2026-08-02 justamente para sairem do veredito estatico.
+    "apply_iris_ops_runtime_patches.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+    },
+    # IRIS_ROUTER_SOURCE: o iris_model_router.py vive no volume e nao esta
+    # versionado. Sem apontar para uma copia real, o patcher aborta com
+    # "missing routing source" e o harness leria isso como RED do patcher --
+    # quando e so falta de insumo. Passe GATE_ROUTER_SOURCE apontando para a
+    # copia; sem ele, o veredito sai INCONCLUSIVO-AMBIENTE, que e honesto.
+    "apply_iris_model_routing_patch.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+        "IRIS_ROUTER_SOURCE": os.environ.get("GATE_ROUTER_SOURCE", str(c / "_router_src")),
+    },
+    "ensure_codex_only.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+        "HERMES_HOME": str(c / "_hermes_home"),
+    },
 }
 
 # Alvo passado por argumento de linha de comando, nao por env.
@@ -71,12 +88,8 @@ ARGUMENTOS = {
     "ensure_allocator_bootstrap.py": lambda c, w: ["--target", str(w / "start.sh")],
 }
 
-# Alvo fixo em /opt ou /data: sem container nao da para executar isolado.
-SO_ESTATICO = {
-    "apply_iris_ops_runtime_patches.py",
-    "apply_iris_model_routing_patch.py",
-    "ensure_codex_only.py",
-}
+# Ainda sem forma de isolar: os tres que estavam aqui foram parametrizados.
+SO_ESTATICO: set[str] = set()
 
 MIN_ANCORA = 40
 IGNORA_PREFIXO = ("http", "/data", "/app", "/opt", "%", "{")
@@ -214,6 +227,8 @@ def veredito(nome: str, r: dict) -> str:
     if "ModuleNotFoundError" in saida:
         return "INCONCLUSIVO-DEP"
     if "FileNotFoundError" in saida and ("/data/" in saida or "/opt/" in saida):
+        return "INCONCLUSIVO-AMBIENTE"
+    if "missing routing source" in saida:
         return "INCONCLUSIVO-AMBIENTE"
     if r["exit"] != 0:
         return "RED"
