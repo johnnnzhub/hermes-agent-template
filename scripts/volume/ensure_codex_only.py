@@ -87,7 +87,17 @@ def _apply_policy(cfg: dict) -> dict:
     cfg["delegation"] = delegation
 
     auxiliary = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
-    for task in AUXILIARY_TASKS:
+    # A lista fixa cobre o que existia quando ela foi escrita. Todo auxiliar NOVO
+    # que o upstream introduz nasce com provider "auto" -- e "auto" e exatamente
+    # o que este script existe para impedir (ja mis-resolveu para Nous Portal).
+    # A 0.19.1 traz dois: goal_judge e memory_query_rewrite. Ambos passariam
+    # batido por uma lista fixa.
+    #
+    # Entao: itera a UNIAO da lista conhecida com tudo que existir no config.
+    # A lista continua servindo para CRIAR os slots conhecidos quando ausentes;
+    # a varredura garante que nenhum auxiliar futuro escape do lock.
+    presentes = {t for t, v in auxiliary.items() if isinstance(v, dict)}
+    for task in sorted(set(AUXILIARY_TASKS) | presentes):
         slot = auxiliary.get(task) if isinstance(auxiliary.get(task), dict) else {}
         slot.update({"provider": PROVIDER, "model": MAIN_MODEL})
         slot.pop("base_url", None)
