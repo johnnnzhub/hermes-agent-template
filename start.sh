@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+
+# BEGIN IRIS RAILWAY ALLOCATOR TUNING
+# Reduce per-thread glibc arena fragmentation in the multithreaded Hermes
+# dashboard/gateways. This changes allocation strategy, not service limits.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
+# END IRIS RAILWAY ALLOCATOR TUNING
 # Mirror dashboard-ref-only's startup: create every directory hermes expects
 # and seed a default config.yaml if the volume is empty. Without these,
 # `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
@@ -56,6 +63,20 @@ fi
 
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
 
+# BEGIN IRIS PERSISTENT PRE-SERVER BOOTSTRAP
+# Reapply volume-backed runtime/config patches before server.py can start the
+# managed gateway. This removes the race between watchdog startup and bridge.
+if [ -x /data/.hermes/scripts/iris_pre_server_bootstrap.sh ]; then
+  if HERMES_HOME=/data/.hermes /data/.hermes/scripts/iris_pre_server_bootstrap.sh \
+      >> /data/.hermes/logs/iris-pre-server-bootstrap.log 2>&1; then
+    export IRIS_PREBOOT_DONE=1
+    export IRIS_WATCHDOGS_STARTED=1
+  else
+    echo "[start] WARN: persistent pre-server bootstrap failed" >&2
+  fi
+fi
+# END IRIS PERSISTENT PRE-SERVER BOOTSTRAP
+
 # is_config_complete() em server.py lê LLM_MODEL do /data/.hermes/.env — mantém em
 # sync com a env var LLM_MODEL do Railway (gpt-5.6-sol) sem precisar salvar pela UI.
 if [ -n "${LLM_MODEL:-}" ]; then
@@ -83,5 +104,17 @@ fi
 # No hermes process can be running at this point (we're pre-exec in a fresh
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
+
+# BEGIN IRIS WATCHDOG DAEMON BOOTSTRAP
+# External supervisor for Hermes Gateway/WhatsApp. Runs outside Hermes cron so it can
+# recover the gateway when the gateway/scheduler itself dies. It is idempotent: the
+# daemon checks its pidfile and exits if another live daemon already exists.
+if [ "${IRIS_WATCHDOGS_STARTED:-0}" != "1" ] && [ -x /data/.hermes/scripts/whatsapp_gateway_watchdog_daemon.py ]; then
+  env -u CODEX_AUTH_B64 HERMES_HOME=/data/.hermes WHATSAPP_WATCHDOG_INTERVAL="${WHATSAPP_WATCHDOG_INTERVAL:-60}" WHATSAPP_WATCHDOG_INITIAL_DELAY="${WHATSAPP_WATCHDOG_INITIAL_DELAY:-30}" nohup /data/.hermes/scripts/whatsapp_gateway_watchdog_daemon.py >> /data/.hermes/logs/whatsapp-gateway-watchdog-daemon.stdout.log 2>&1 &
+fi
+if [ "${IRIS_WATCHDOGS_STARTED:-0}" != "1" ] && [ -x /data/.hermes/profiles/foxy/scripts/foxy_gateway_watchdog_daemon.py ]; then
+  env -u CODEX_AUTH_B64 HERMES_HOME=/data/.hermes/profiles/foxy FOXY_HERMES_HOME=/data/.hermes/profiles/foxy nohup /data/.hermes/profiles/foxy/scripts/foxy_gateway_watchdog_daemon.py --allow-mutating-hermes >> /data/.hermes/profiles/foxy/logs/foxy-gateway-watchdog-daemon.stdout.log 2>&1 &
+fi
+# END IRIS WATCHDOG DAEMON BOOTSTRAP
 
 exec python /app/server.py
