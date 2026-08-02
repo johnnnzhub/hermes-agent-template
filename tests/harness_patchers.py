@@ -81,6 +81,17 @@ ISOLAVEIS = {
         "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
         "HERMES_HOME": str(c / "_hermes_home"),
     },
+    # Os tres de grupo, que vivem fora do repo (ver --patchers).
+    "apply_iris_journal_group_capture_patch.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+    },
+    "apply_iris_tasks_router_gateway_patch.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+    },
+    "ensure_whatsapp_group_routes.py": lambda c, w: {
+        "IRIS_CORE_ROOT": str(c), "IRIS_APP_ROOT": str(w),
+        "HERMES_HOME": str(c / "_hermes_home"),
+    },
 }
 
 # Alvo passado por argumento de linha de comando, nao por env.
@@ -247,7 +258,15 @@ def main() -> int:
     ap.add_argument("--core", required=True, help="arvore do core a testar")
     ap.add_argument("--wrapper", default=str(RAIZ), help="arvore do wrapper (default: este repo)")
     ap.add_argument("--json", help="grava o resultado bruto")
+    # Tres patchers nao estao versionados porque embutem IDs de grupo e o repo do
+    # template e publico. Eles ainda precisam de veredito -- e justamente os de
+    # grupo. Este parametro deixa aponta-los numa copia fora do repo.
+    ap.add_argument("--patchers", help="diretorio alternativo de patchers")
     args = ap.parse_args()
+
+    global PATCHERS
+    if args.patchers:
+        PATCHERS = pathlib.Path(args.patchers).resolve()
 
     core = pathlib.Path(args.core).resolve()
     wrapper = pathlib.Path(args.wrapper).resolve()
