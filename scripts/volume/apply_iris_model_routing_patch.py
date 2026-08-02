@@ -70,6 +70,31 @@ MAIN_NEW = """            turn_route = self._resolve_turn_agent_config(message, 
 
             # Check agent cache"""
 
+# Variante 0.19.1 do mesmo ponto. O upstream extraiu o bloco do metodo grande
+# para `run_sync`, e la dentro os nomes mudaram todos de forma sistematica:
+#   self          -> self._runner   (metodos e atributos do runner)
+#   message       -> ctx.message
+#   session_key   -> ctx.session_key
+#   indentacao    -> 8 espacos, nao 12
+#
+# Cada nome foi conferido no escopo real (run_sync, linhas 4067-5396 da 0.19.1):
+# `reasoning_config` e local (atribuido em 4134), `_session_reasoning_overrides`
+# e uma legacy_dict_property do runner, e o proprio upstream escreve
+# `self._runner._reasoning_config = reasoning_config` na linha 4139. Ou seja, o
+# bloco abaixo usa o mesmo idioma do codigo vizinho, nao uma invencao nossa.
+#
+# As duas variantes convivem de proposito: o patcher precisa funcionar na 0.18.2
+# tambem, senao o rollback deixa de ser simetrico.
+MAIN_ANCHOR_0191 = """        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+
+        # Check agent cache"""
+MAIN_NEW_0191 = """        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        if ctx.session_key not in (getattr(self._runner, \"_session_reasoning_overrides\", {}) or {}):
+            reasoning_config = turn_route.get(\"routing_reasoning_config\") or reasoning_config
+            self._runner._reasoning_config = reasoning_config
+
+        # Check agent cache"""
+
 
 def atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".iris-tmp")
@@ -116,15 +141,28 @@ def patch_gateway() -> bool:
             atomic_write(GATEWAY, after)
             return True
         return False
-    required = [IMPORT, ROUTE_ANCHOR, TIER_ANCHOR, BG_ANCHOR, MAIN_ANCHOR]
+    # O ponto principal tem duas formas: a da 0.18.2 e a da 0.19.1, que extraiu
+    # o bloco para `run_sync` e renomeou self -> self._runner, message ->
+    # ctx.message, session_key -> ctx.session_key. Escolhe a que casar; exigir a
+    # das duas quebraria numa versao ou na outra, e o rollback precisa das duas.
+    if MAIN_ANCHOR in before:
+        main_ancora, main_novo = MAIN_ANCHOR, MAIN_NEW
+    elif MAIN_ANCHOR_0191 in before:
+        main_ancora, main_novo = MAIN_ANCHOR_0191, MAIN_NEW_0191
+    else:
+        main_ancora = main_novo = None
+
+    required = [IMPORT, ROUTE_ANCHOR, TIER_ANCHOR, BG_ANCHOR]
     missing = [repr(x[:60]) for x in required if x not in before]
+    if main_ancora is None:
+        missing.append("ponto principal (nem forma 0.18.2 nem 0.19.1)")
     if missing:
         raise RuntimeError("gateway anchors missing: " + ", ".join(missing))
     after = before.replace(IMPORT, IMPORT_NEW, 1)
     after = after.replace(ROUTE_ANCHOR, ROUTE_NEW, 1)
     after = after.replace(TIER_ANCHOR, TIER_NEW, 1)
     after = after.replace(BG_ANCHOR, BG_NEW, 1)
-    after = after.replace(MAIN_ANCHOR, MAIN_NEW, 1)
+    after = after.replace(main_ancora, main_novo, 1)
     atomic_write(GATEWAY, after)
     return True
 
