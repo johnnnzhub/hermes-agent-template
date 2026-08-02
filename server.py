@@ -271,6 +271,20 @@ def write_config_yaml(data: dict[str, str]) -> None:
 
     merged["data_dir"] = HERMES_HOME
 
+    # Iris/John deployment defaults: keep operator-facing technical wrappers silent
+    # even if the admin setup flow rewrites config.yaml after a gateway restart.
+    merged_compression = dict(merged.get("compression") if isinstance(merged.get("compression"), dict) else {})
+    merged_compression.setdefault("enabled", True)
+    merged_compression.setdefault("threshold", 0.50)
+    merged_compression["codex_gpt55_autoraise"] = True
+    merged_compression["suppress_notices"] = True
+    merged_compression.setdefault("in_place", True)
+    merged["compression"] = merged_compression
+
+    merged_cron = dict(merged.get("cron") if isinstance(merged.get("cron"), dict) else {})
+    merged_cron["wrap_response"] = False
+    merged["cron"] = merged_cron
+
     # Custom OpenAI-compatible endpoint — write custom_providers block when configured,
     # remove it when not (safe on Railway where users don't hand-edit config.yaml).
     custom_base_url = data.get("CUSTOM_PROVIDER_BASE_URL", "").strip()
@@ -835,7 +849,7 @@ class Gateway:
             )
             self.state = "running"
             self.started_at = time.time()
-            asyncio.create_task(self._drain())
+            asyncio.create_task(self._drain(self.proc))
         except Exception as e:
             self.state = "error"
             self.logs.append(f"[error] Failed to start: {e}")
@@ -859,14 +873,14 @@ class Gateway:
         self.restarts += 1
         await self.start()
 
-    async def _drain(self):
-        assert self.proc and self.proc.stdout
-        async for raw in self.proc.stdout:
+    async def _drain(self, proc):
+        assert proc and proc.stdout
+        async for raw in proc.stdout:
             line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
             self.logs.append(line)
-        if self.state == "running":
+        if self.proc is proc and self.state == "running":
             self.state = "error"
-            self.logs.append(f"[error] Gateway exited (code {self.proc.returncode})")
+            self.logs.append(f"[error] Gateway exited (code {proc.returncode})")
 
     def status(self) -> dict:
         uptime = int(time.time() - self.started_at) if self.started_at and self.state == "running" else None
@@ -1628,8 +1642,7 @@ async def route_glass_tasks(request: Request) -> Response:
             status_code=503,
             headers=_GLASS_CORS,
         )
-    auth = request.headers.get("authorization", "")
-    if not _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}"):
+    if not _glass_authorized(request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401, headers=_GLASS_CORS)
 
     try:
