@@ -9,49 +9,66 @@ BOOT_LOG="$LOG_DIR/iris-pre-server-bootstrap.log"
 mkdir -p "$LOG_DIR" "$HERMES_HOME/scripts" "$FOXY_HOME/logs" 2>/dev/null || true
 log(){ printf '%s %s
 ' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$BOOT_LOG" 2>/dev/null || true; }
+
+# ── Relatorio de patchers ────────────────────────────────────────────────────
+#
+# Ate 2026-08-02 cada patcher rodava com `|| log WARN` e mais nada. Patcher morto
+# virava uma linha de log num arquivo que ninguem le, e o container subia com
+# /health 200 enquanto uma funcao morria calada. Dois ja estavam nesse estado ha
+# semanas sem ninguem notar.
+#
+# A correcao NAO e abortar o boot. Hoje ha patcher vermelho conhecido em
+# producao; fail-closed direto brickaria a Iris no proximo boot -- trocaria
+# "degradado em silencio" por "fora do ar", que e pior.
+#
+# Entao: por padrao continua tolerante, MAS grava um relatorio legivel por
+# maquina (patcher -> ok/falhou) que o check pos-deploy diffa contra o baseline.
+# O modo estrito e opt-in por IRIS_BOOTSTRAP_STRICT=1, para ser ligado depois
+# que o baseline estiver limpo. Ligar antes disso e o erro que este comentario
+# existe para impedir.
+RELATORIO="$HERMES_HOME/runtime/bootstrap-patchers.json"
+mkdir -p "$(dirname "$RELATORIO")" 2>/dev/null || true
+_resultados=""
+_falhas=0
+
+roda_patcher(){
+  # $1 = rotulo curto, $2 = caminho, $3.. = argumentos
+  local rotulo="$1" caminho="$2"; shift 2
+  [ -f "$caminho" ] || { _resultados="${_resultados}${_resultados:+,}\"$rotulo\":\"ausente\""; return 0; }
+  if python "$caminho" "$@" >> "$BOOT_LOG" 2>&1; then
+    _resultados="${_resultados}${_resultados:+,}\"$rotulo\":\"ok\""
+    return 0
+  fi
+  _resultados="${_resultados}${_resultados:+,}\"$rotulo\":\"falhou\""
+  _falhas=$((_falhas + 1))
+  log "WARN $rotulo failed"
+  if [ "${IRIS_BOOTSTRAP_STRICT:-0}" = "1" ]; then
+    log "FATAL modo estrito: abortando o boot por falha em $rotulo"
+    printf '{"strict":true,"aborted_on":"%s",%s}\n' "$rotulo" "$_resultados" > "$RELATORIO" 2>/dev/null || true
+    exit 1
+  fi
+  return 0
+}
+
 log "pre-server bootstrap start"
-if [ -x "$HERMES_HOME/scripts/ensure_allocator_bootstrap.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_allocator_bootstrap.py" >> "$BOOT_LOG" 2>&1 || log "WARN allocator bootstrap failed"
-fi
-if [ -x "$HERMES_HOME/scripts/ensure_tini_bootstrap.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_tini_bootstrap.py" >> "$BOOT_LOG" 2>&1 || log "WARN tini bootstrap failed"
-fi
-if [ -x "$HERMES_HOME/scripts/ensure_persistent_mcp_binaries.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_persistent_mcp_binaries.py" >> "$BOOT_LOG" 2>&1 || log "WARN persistent MCP bootstrap failed"
-fi
+roda_patcher ensure_allocator_bootstrap "$HERMES_HOME/scripts/ensure_allocator_bootstrap.py"
+roda_patcher ensure_tini_bootstrap "$HERMES_HOME/scripts/ensure_tini_bootstrap.py"
+roda_patcher ensure_persistent_mcp_binaries "$HERMES_HOME/scripts/ensure_persistent_mcp_binaries.py"
 # BEGIN IRIS ONE-SHOT POST-RESTART VERIFIER
 if [ -x "$HERMES_HOME/scripts/post_restart_verifier.py" ] && [ -f "$HERMES_HOME/runtime/restart-verifier.armed" ]; then
   python "$HERMES_HOME/scripts/post_restart_verifier.py" >> "$HERMES_HOME/logs/post-restart-verifier.log" 2>&1 &
 fi
 # END IRIS ONE-SHOT POST-RESTART VERIFIER
-if [ -x "$HERMES_HOME/scripts/ensure_codex_only.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_codex_only.py" >> "$BOOT_LOG" 2>&1 || log "WARN codex-only lock failed"
-fi
-if [ -x "$HERMES_HOME/scripts/ensure_codex_oauth_gateway_autostart.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_codex_oauth_gateway_autostart.py" >> "$BOOT_LOG" 2>&1 || log "WARN Codex OAuth gateway autostart patch failed"
-fi
+roda_patcher ensure_codex_only "$HERMES_HOME/scripts/ensure_codex_only.py"
+roda_patcher ensure_codex_oauth_gateway_autostart "$HERMES_HOME/scripts/ensure_codex_oauth_gateway_autostart.py"
 # Patches operacionais idempotentes do runtime Hermes/Iris.
-if [ -f "$HERMES_HOME/scripts/apply_iris_ops_runtime_patches.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_ops_runtime_patches.py" >> "$BOOT_LOG" 2>&1 || log "WARN runtime patch failed"
-fi
-if [ -f "$HERMES_HOME/scripts/apply_iris_model_routing_patch.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_model_routing_patch.py" >> "$BOOT_LOG" 2>&1 || log "WARN model routing patch failed"
-fi
-if [ -f "$HERMES_HOME/scripts/apply_iris_cron_whatsapp_context_patch.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_cron_whatsapp_context_patch.py" >> "$BOOT_LOG" 2>&1 || log "WARN cron WhatsApp context patch failed"
-fi
-if [ -x "$HERMES_HOME/scripts/apply_iris_whatsapp_owner_groups_patch.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_whatsapp_owner_groups_patch.py" >> "$BOOT_LOG" 2>&1 || log "WARN WhatsApp owner-group runtime patch failed"
-fi
-if [ -x "$HERMES_HOME/scripts/ensure_whatsapp_group_routes.py" ]; then
-  python "$HERMES_HOME/scripts/ensure_whatsapp_group_routes.py" >> "$BOOT_LOG" 2>&1 || log "WARN group route self-heal failed"
-fi
-if [ -x "$HERMES_HOME/scripts/apply_iris_journal_group_capture_patch.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_journal_group_capture_patch.py" >> "$BOOT_LOG" 2>&1 || log "WARN journal group capture patch failed"
-fi
-if [ -x "$HERMES_HOME/scripts/apply_iris_tasks_router_gateway_patch.py" ]; then
-  python "$HERMES_HOME/scripts/apply_iris_tasks_router_gateway_patch.py" >> "$BOOT_LOG" 2>&1 || log "WARN tasks router gateway patch failed"
-fi
+roda_patcher apply_iris_ops_runtime_patches "$HERMES_HOME/scripts/apply_iris_ops_runtime_patches.py"
+roda_patcher apply_iris_model_routing_patch "$HERMES_HOME/scripts/apply_iris_model_routing_patch.py"
+roda_patcher apply_iris_cron_whatsapp_context_patch "$HERMES_HOME/scripts/apply_iris_cron_whatsapp_context_patch.py"
+roda_patcher apply_iris_whatsapp_owner_groups_patch "$HERMES_HOME/scripts/apply_iris_whatsapp_owner_groups_patch.py"
+roda_patcher ensure_whatsapp_group_routes "$HERMES_HOME/scripts/ensure_whatsapp_group_routes.py"
+roda_patcher apply_iris_journal_group_capture_patch "$HERMES_HOME/scripts/apply_iris_journal_group_capture_patch.py"
+roda_patcher apply_iris_tasks_router_gateway_patch "$HERMES_HOME/scripts/apply_iris_tasks_router_gateway_patch.py"
 if [ "${IRIS_WATCHDOGS_STARTED:-0}" != "1" ]; then
   if [ -x "$HERMES_HOME/scripts/whatsapp_gateway_watchdog_daemon.py" ]; then
     env -u CODEX_AUTH_B64 HERMES_HOME="$HERMES_HOME" \
@@ -72,4 +89,13 @@ if [ "${IRIS_WATCHDOGS_STARTED:-0}" != "1" ]; then
 else
   log "watchdog launch skipped: already owned by an earlier bootstrap layer"
 fi
+
+# Relatorio legivel por maquina. E contra este arquivo que o check pos-deploy
+# compara -- nao contra contagem de WARN, que nao enxerga o patcher que retorna
+# exit 0 e imprime "skip patch".
+printf '{"strict":%s,"falhas":%s,%s}\n' \
+  "$([ "${IRIS_BOOTSTRAP_STRICT:-0}" = "1" ] && echo true || echo false)" \
+  "$_falhas" "$_resultados" > "$RELATORIO" 2>/dev/null || true
+log "patchers: $_falhas falha(s); relatorio em $RELATORIO"
+
 log "pre-server bootstrap done"
