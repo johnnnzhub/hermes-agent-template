@@ -63,25 +63,31 @@ BRIDGE_NEW = """      if (msg.key.fromMe) {
         if (WHATSAPP_MODE === 'bot') {
 """
 
-ADAPTER_INIT_OLD = """        self._group_policy = str(config.extra.get(\"group_policy\") or os.getenv(\"WHATSAPP_GROUP_POLICY\", \"pairing\")).strip().lower()
-        self._group_allow_from = self._coerce_allow_list(config.extra.get(\"group_allow_from\") or config.extra.get(\"groupAllowFrom\"))
-        self._mention_patterns = self._compile_mention_patterns()
+# Ancoras: o MENOR trecho contiguo estavel, nao o bloco inteiro.
+#
+# Ate 2026-08-02 estas duas ancoras eram blocos de 3 e 4 linhas contiguas. O
+# upstream inseriu tratamento de `send_read_receipts` no MEIO das duas entre
+# 0.18.2 e 0.19.1 -- sem remover nem renomear nada -- e as duas pararam de casar.
+# Bloco longo e fragil por construcao: quanto mais linhas a ancora cobre, maior a
+# chance de o upstream escrever alguma coisa la dentro. Ancorar numa unica linha
+# estavel e inserir DEPOIS dela sobrevive a insercao de vizinhos.
+#
+# Verificado nas duas arvores: as ancoras abaixo casam exatamente uma vez em
+# 0.18.2 e em 0.19.1.
+ADAPTER_INIT_OLD = """        self._group_allow_from = self._coerce_allow_list(config.extra.get(\"group_allow_from\") or config.extra.get(\"groupAllowFrom\"))
 """
-ADAPTER_INIT_NEW = """        self._group_policy = str(config.extra.get(\"group_policy\") or os.getenv(\"WHATSAPP_GROUP_POLICY\", \"pairing\")).strip().lower()
-        self._group_allow_from = self._coerce_allow_list(config.extra.get(\"group_allow_from\") or config.extra.get(\"groupAllowFrom\"))
+ADAPTER_INIT_NEW = """        self._group_allow_from = self._coerce_allow_list(config.extra.get(\"group_allow_from\") or config.extra.get(\"groupAllowFrom\"))
         _forward_owner_messages = config.extra.get(\"forward_owner_messages\")
         if _forward_owner_messages is None:
             _forward_owner_messages = os.getenv(\"WHATSAPP_FORWARD_OWNER_MESSAGES\", \"\")
         self._forward_owner_messages = str(_forward_owner_messages).strip().lower() in {
             \"1\", \"true\", \"yes\", \"on\",
         }
-        self._mention_patterns = self._compile_mention_patterns()
 """
 
 ADAPTER_ENV_OLD = """            bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
                 bridge_env[\"WHATSAPP_REPLY_PREFIX\"] = self._reply_prefix
-            # Pass the profile-aware cache directories so the bridge writes
 """
 ADAPTER_ENV_NEW = """            bridge_env = with_hermes_node_path()
             if self._reply_prefix is not None:
@@ -103,7 +109,6 @@ ADAPTER_ENV_NEW = """            bridge_env = with_hermes_node_path()
                 bridge_allowed_users.update(self._group_allow_from)
             if bridge_allowed_users:
                 bridge_env[\"WHATSAPP_ALLOWED_USERS\"] = \",\".join(sorted(bridge_allowed_users))
-            # Pass the profile-aware cache directories so the bridge writes
 """
 
 
