@@ -20,7 +20,13 @@ SAIDA="${3:-$(mktemp -d)}"
 PY="${GATE_PYTHON:-python3}"
 
 mkdir -p "$SAIDA"
-PRISTINO="$SAIDA/wrapper-pristino"
+
+# O wrapper pristino e insumo de teste, nao evidencia: e uma copia byte a byte
+# de um commit que o repo ja guarda. Vai para um temporario, senao poluiria o
+# diretorio de saida com dezenas de arquivos duplicados (aconteceu na primeira
+# execucao e entrou num commit).
+PRISTINO="$(mktemp -d)/wrapper-pristino"
+trap 'rm -rf "$(dirname "$PRISTINO")"' EXIT
 
 # O wrapper tem que ser o do commit BASE, nao a working tree: patcher rodando
 # contra arvore ja patchada nao muda nada, e "nao mudou nada" e indistinguivel
