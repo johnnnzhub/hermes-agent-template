@@ -1633,6 +1633,19 @@ _GLASS_CORS = {
 _GLASS_ACTIONS = {"task.done", "task.snooze"}
 
 
+def _glass_authorized(request: Request) -> bool:
+    """Bearer GLASS_TOKEN em tempo constante. Sem token configurado → nunca autoriza.
+
+    Existia só como chamada em route_glass_tasks: o patcher do volume
+    (apply_iris_ops_runtime_patches.py) trocava o compare_digest inline pela
+    chamada num bloco, e inseria a definição noutro — quando a âncora do
+    segundo bloco não casou, gravou o arquivo com a chamada e sem a função.
+    Resultado: GET /glass/tasks levantava NameError → 500, desde 2026-07-13.
+    """
+    auth = request.headers.get("authorization", "")
+    return bool(GLASS_TOKEN) and _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}")
+
+
 async def route_glass_tasks(request: Request) -> Response:
     if request.method == "OPTIONS":
         return Response(status_code=204, headers=_GLASS_CORS)
@@ -1698,8 +1711,7 @@ async def route_glass_task(request: Request) -> Response:
             status_code=503,
             headers=_GLASS_CORS,
         )
-    auth = request.headers.get("authorization", "")
-    if not _hmac.compare_digest(auth, f"Bearer {GLASS_TOKEN}"):
+    if not _glass_authorized(request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401, headers=_GLASS_CORS)
 
     try:
