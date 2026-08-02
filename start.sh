@@ -44,14 +44,36 @@ if [ -n "${CODEX_AUTH_B64:-}" ] && [ ! -f "$HOME/.codex/auth.json" ]; then
   chmod 600 "$HOME/.codex/auth.json"
 fi
 
-# Config gerenciado: aplica o deploy-config.yaml versionado (provider openai-codex,
-# model gpt-5.6-sol, fallback + auxiliary em OpenRouter) a CADA boot. Self-heal da trap
-# do write_config_yaml em server.py — salvar na UI /setup re-força provider "auto",
-# mas o próximo boot restaura o provider correto a partir deste arquivo.
-if [ -f /app/deploy-config.yaml ]; then
-  cp /app/deploy-config.yaml /data/.hermes/config.yaml
-elif [ ! -f /data/.hermes/config.yaml ] && [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
-  cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
+# Config: SEMENTE, não sobrescrita.
+#
+# Até 2026-08-02 este bloco copiava /app/deploy-config.yaml por cima do
+# /data/.hermes/config.yaml a CADA boot. A intenção era self-heal da trap do
+# write_config_yaml em server.py (salvar na UI /setup re-forçava provider "auto").
+#
+# O efeito colateral só ficou visível quando comparamos o vivo com o repo: o
+# config persistente acumulou tudo que define a operação real — allowlist dos 7
+# grupos de WhatsApp, free_response_chats, cadeia codex-only dos 14 auxiliares,
+# delegation, model_aliases, moa, plugins — e o deploy-config.yaml versionado não
+# tem nada disso. Ou seja, qualquer cold boot de uma imagem construída a partir do
+# repo APAGARIA os grupos do John e devolveria OpenRouter/Gemini aos auxiliares.
+# Config não era gerenciado pelo repo; era destruído por ele.
+#
+# A trap original continua coberta, por dois mecanismos que não existiam em 2026-06:
+#   1. write_config_yaml (server.py) só força "auto" quando não há provider
+#      explícito não-auto (corrigido em 2026-06-16);
+#   2. ensure_codex_only.py roda no pre-server bootstrap, LOGO ABAIXO, e repara
+#      deriva de provider no config canônico a cada boot.
+#
+# Escape hatch: IRIS_FORCE_CONFIG_SEED=1 restaura o comportamento antigo para um
+# boot, para o caso de precisar reimpor o config da imagem deliberadamente.
+if [ ! -f /data/.hermes/config.yaml ] || [ "${IRIS_FORCE_CONFIG_SEED:-0}" = "1" ]; then
+  if [ -f /app/deploy-config.yaml ]; then
+    cp /app/deploy-config.yaml /data/.hermes/config.yaml
+    echo "[start] config.yaml semeado a partir de /app/deploy-config.yaml" >&2
+  elif [ -f /opt/hermes-agent/cli-config.yaml.example ]; then
+    cp /opt/hermes-agent/cli-config.yaml.example /data/.hermes/config.yaml
+    echo "[start] config.yaml semeado a partir do exemplo do core" >&2
+  fi
 fi
 
 # Persona: SOUL.md ocupa o slot #1 do system prompt (identidade do agente).
