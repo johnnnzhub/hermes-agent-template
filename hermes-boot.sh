@@ -399,4 +399,29 @@ else
 fi
 
 # Encadeia o entrypoint ORIGINAL (intacto): start.sh -> exec server.py
-if [ -x /app/start.sh ]; then exec /app/start.sh; else exec python /app/server.py; fi
+# BEGIN IRIS PERSISTENT PRE-SERVER BOOTSTRAP
+# Reapply volume-backed runtime patches once per boot process tree.
+if [ "${IRIS_PREBOOT_DONE:-0}" != "1" ] && [ -x /data/.hermes/scripts/iris_pre_server_bootstrap.sh ]; then
+  if HERMES_HOME="${HERMES_HOME:-/data/.hermes}" /data/.hermes/scripts/iris_pre_server_bootstrap.sh >> /data/.hermes/logs/iris-pre-server-bootstrap.log 2>&1; then
+    export IRIS_PREBOOT_DONE=1
+    export IRIS_WATCHDOGS_STARTED=1
+  else
+    log "WARN: persistent pre-server bootstrap failed"
+  fi
+fi
+# END IRIS PERSISTENT PRE-SERVER BOOTSTRAP
+
+# BEGIN IRIS TINI INIT SUPERVISOR
+# Keep a real init as PID 1 so orphaned MCP/watchdog descendants are reaped.
+# The fallback preserves availability if a future image unexpectedly omits tini.
+if [ -x /usr/bin/tini ]; then
+  if [ -x /app/start.sh ]; then
+    exec /usr/bin/tini -s -- /app/start.sh
+  else
+    exec /usr/bin/tini -s -- python /app/server.py
+  fi
+else
+  log "WARN: /usr/bin/tini unavailable; starting without init supervisor"
+  if [ -x /app/start.sh ]; then exec /app/start.sh; else exec python /app/server.py; fi
+fi
+# END IRIS TINI INIT SUPERVISOR
