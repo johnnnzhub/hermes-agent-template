@@ -75,7 +75,9 @@ function authHeaders(): Record<string, string> {
   return token ? { authorization: `Bearer ${token}` } : {}
 }
 
-async function responseError(response: Response): Promise<ApiError> {
+// Exportada para teste: a distincao entre "rota sumiu" e "sem rede" e justamente o
+// que faltou no incidente de 2026-08-03, entao precisa de cobertura propria.
+export async function responseError(response: Response): Promise<ApiError> {
   let message = ''
   try {
     const body = await response.json()
@@ -91,7 +93,14 @@ async function responseError(response: Response): Promise<ApiError> {
   }
   if (response.status === 413) return new ApiError(response.status, 'Áudio longo demais.')
   if (response.status === 422) return new ApiError(response.status, message || 'Não encontrei fala nesse áudio.')
-  return new ApiError(response.status, message || 'Sem conexão com o HERMES.')
+  // 404 = o servidor respondeu, mas nao tem a rota: backend desatualizado ou nao
+  // promovido. Em 2026-08-03 isso caiu no texto generico de "sem conexao" e mandou o
+  // diagnostico para rede, DNS e TLS durante quase uma hora. Nunca mais confundir uma
+  // resposta HTTP com ausencia de rede.
+  if (response.status === 404) {
+    return new ApiError(response.status, 'HERMES desatualizado: rota ausente no servidor.')
+  }
+  return new ApiError(response.status, message || `HERMES respondeu erro ${response.status}.`)
 }
 
 function normalizedSession(raw: unknown): HermesSession {
