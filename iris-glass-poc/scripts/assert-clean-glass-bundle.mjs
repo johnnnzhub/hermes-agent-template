@@ -58,6 +58,8 @@ const REQUIRED = [
   // entregar a fala direto, que e justamente o que a confirmacao existe para impedir.
   'CONFIRMAR',
   'TOQUE = ENVIAR',
+  'BAIXO = VER O RESTO',
+  'NÃO SEI SE ENTROU',
   /\/commit/,
 ]
 

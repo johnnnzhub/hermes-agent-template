@@ -358,22 +358,36 @@ export function createGlassConversationRouter({
    * disto — e a checagem de revision tem de ser refeita no instante da submissao, nao
    * herdada do momento em que o audio subiu.
    */
+  // Uma submissao por vez. Sem a fila, dois turnos podiam ler o mesmo snapshot, aprovar a
+  // mesma revision e escrever os dois — a checagem passava nos dois porque nada acontecia
+  // entre ela e o prompt. Nao cobre escritores de fora deste router (terminal, atalho do
+  // iPhone), e por isso a revision e reconferida DENTRO da fila.
+  let submitQueue = Promise.resolve();
+
   async function submitTranscript(clientMsgId, transcript, expectedRevision) {
-    const snapshot = await sessionSnapshot(provider, events);
-    if (snapshot.state !== "idle") {
-      return { status: 409, body: { error: "A Iris já está trabalhando." } };
-    }
-    if (snapshot.revision !== expectedRevision) {
+    const run = submitQueue.then(async () => {
+      const snapshot = await sessionSnapshot(provider, events);
+      if (snapshot.state !== "idle") {
+        return { status: 409, body: { error: "A Iris já está trabalhando." } };
+      }
+      if (snapshot.revision !== expectedRevision) {
+        return {
+          status: 409,
+          body: { error: "A conversa mudou; atualize antes de enviar." },
+        };
+      }
+      const accepted = await provider.prompt(snapshot.session.id, transcript);
       return {
-        status: 409,
-        body: { error: "A conversa mudou; atualize antes de enviar." },
+        status: 202,
+        body: { ok: true, sessionId: accepted.sessionId, clientMsgId, transcript },
       };
-    }
-    const accepted = await provider.prompt(snapshot.session.id, transcript);
-    return {
-      status: 202,
-      body: { ok: true, sessionId: accepted.sessionId, clientMsgId, transcript },
-    };
+    });
+    // A fila nao pode morrer com o turno: um erro aqui travaria toda submissao seguinte.
+    submitQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   router.post(
@@ -385,8 +399,15 @@ export function createGlassConversationRouter({
         return;
       }
       const audio = parsed.value;
+      // `confirm` entra na impressao digital: sem isso, um cliente ANTIGO reenviando o
+      // mesmo id receberia o corpo `200 staged` guardado aqui, leria os campos que ele
+      // conhece (ok, sessionId, transcript) e daria a fala como ENTREGUE — sem nenhum
+      // prompt ter acontecido. Incluindo o campo, ele recebe 409 e para com a gravacao,
+      // que e a diferenca entre um downgrade seguro e uma fala perdida em silencio.
       const fingerprint = createHash("sha256")
-        .update(`${audio.expectedRevision}\u0000${audio.pcmB64}`)
+        .update(
+          `${audio.expectedRevision}\u0000${audio.confirm ? "1" : "0"}\u0000${audio.pcmB64}`,
+        )
         .digest("hex");
       let entry = dedupe.get(audio.clientMsgId);
       if (entry && entry.fingerprint !== fingerprint) {
@@ -542,8 +563,16 @@ export function createGlassConversationRouter({
             entry.result = result;
             return;
           }
-          // 409 e 5xx nao gravam: a conversa pode voltar a idle e o mesmo toque, mais
-          // tarde, deve poder entregar a fala em vez de repetir um erro velho.
+          if (result.status >= 500) {
+            // NAO libera para nova tentativa. O RPC pode ter escrito o frame antes de
+            // estourar, entao um segundo commit automatico faria a Iris agir duas vezes
+            // sobre a mesma fala. Fica memorizado como desfecho ambiguo, e quem decide
+            // reenviar e o John — com turno novo, depois de olhar a conversa.
+            entry.result = result;
+            return;
+          }
+          // 409 nao grava nada: submitTranscript devolve antes de chamar provider.prompt,
+          // entao a conversa pode voltar a idle e o mesmo toque, mais tarde, entrega.
           entry.commit = null;
         });
       }

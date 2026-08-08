@@ -47,6 +47,8 @@ export type SendReason =
   | 'no-speech'
   | 'too-long'
   | 'server'
+  /** O commit falhou depois de o servidor poder ter escrito: desfecho desconhecido. */
+  | 'ambiguous'
   | 'exhausted'
 
 export interface SendState {
@@ -298,7 +300,14 @@ export function reduce(state: SendState, event: SendEvent): SendState {
       // O servidor esqueceu o turno (restart, eviccao). O audio ainda esta no rascunho,
       // entao o caminho e subir de novo — e confirmar de novo.
       if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
-      if (event.kind === 'http') return fromHttp(state, event.status)
+      if (event.kind === 'http') {
+        // 5xx no commit e a unica ambiguidade real deste fluxo: o RPC pode ter escrito o
+        // frame antes de estourar. Insistir sozinho aqui arriscaria a Iris agir duas vezes
+        // sobre a mesma fala, entao para e devolve a decisao ao John — com o rascunho
+        // intacto e exigindo turno novo, que e o que impede a repeticao silenciosa.
+        if (event.status >= 500) return park(state, 'ambiguous', true)
+        return fromHttp(state, event.status)
+      }
       // O commit e barato, mas a duvida e a mesma de sempre: perguntar por id custa menos
       // que adivinhar, e responde se a fala entrou.
       if (event.kind === 'network') return toAsk(state, 'network')
@@ -309,6 +318,10 @@ export function reduce(state: SendState, event: SendEvent): SendState {
       // Resposta definitiva do servidor sobre ESTE id — nao inferencia sobre a sessao.
       if (event.kind === 'status-done') {
         if (event.turnStatus === 202) return accept(state, event.transcript)
+        // Um 5xx GRAVADO pelo servidor e desfecho, nao falha de transporte: ele tentou e
+        // terminou assim. Passar isso por fromHttp devolvia a fase 'ask', que perguntava de
+        // novo, recebia o mesmo 5xx e girava sem espera nenhuma no meio.
+        if (event.turnStatus >= 500) return park(state, 'server')
         // 200: transcrito e retido. A fala NAO foi entregue, entao o rascunho fica e o HUD
         // volta a pedir o toque. Cair no fromHttp aqui pararia com "HERMES FORA DO AR"
         // diante de um servidor que esta apenas esperando a decisao do John.
@@ -385,6 +398,8 @@ export function reasonHeadline(reason: SendReason): string {
       return 'TOKEN DO HERMES INVÁLIDO'
     case 'conflict':
       return 'A CONVERSA MUDOU'
+    case 'ambiguous':
+      return 'NÃO SEI SE ENTROU'
     case 'no-speech':
       return 'NÃO OUVI FALA SUFICIENTE'
     case 'too-long':

@@ -8,6 +8,7 @@ import {
   safeProgress,
 } from "../src/glass-conversation.mjs";
 import { createApp } from "../src/server.mjs";
+import { ProviderError } from "../src/hermes-provider.mjs";
 import { createHarness, waitFor } from "./helpers/harness.mjs";
 
 const TERMINAL_TOKEN =
@@ -552,4 +553,99 @@ test("a revision divergente rejeita o turno sem submeter nada", async (t) => {
   assert.equal(after.body.revision, before.body.revision);
   assert.equal(after.body.turns.length, before.body.turns.length);
   assert.equal(after.body.state, "idle");
+});
+
+/** Servidor com um provider de mentira, para observar quantos prompts sao emitidos. */
+async function createStubHarness({ promptImpl }) {
+  const prompts = [];
+  const provider = {
+    async listSessions() {
+      return [{ id: "stub-session" }];
+    },
+    getStatus() {
+      return { state: "idle", turnDurationMs: 0 };
+    },
+    async getHistory() {
+      return [];
+    },
+    async prompt(sessionId, text) {
+      prompts.push(text);
+      return promptImpl(sessionId, text, prompts.length);
+    },
+  };
+  const events = new EventBuffer();
+  const app = createApp({
+    provider,
+    events,
+    token: TERMINAL_TOKEN,
+    glassToken: GLASS_TOKEN,
+    glassTranscriber: { async transcribe() { return "fala do john"; } },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return {
+    prompts,
+    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    async closeHttp() {
+      events.close();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+// O RPC pode ter escrito o frame antes de estourar. Liberar o commit para nova tentativa
+// depois de um 5xx fazia a Iris agir DUAS VEZES sobre a mesma fala — e agir e o que nao
+// tem desfazer. O desfecho ambiguo fica memorizado; quem decide reenviar e o John.
+test("commit que falha com 5xx não emite um segundo prompt sozinho", async (t) => {
+  const harness = await createStubHarness({
+    promptImpl() {
+      throw new ProviderError("Iris indisponível", 503);
+    },
+  });
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const staged = await postTurn(harness, {
+    clientMsgId: "ambiguo-0001",
+    expectedRevision: before.body.revision,
+    confirm: true,
+  });
+  assert.equal(staged.response.status, 200);
+
+  const first = await postCommit(harness, "ambiguo-0001", before.body.revision);
+  assert.equal(first.response.status, 503);
+  assert.equal(harness.prompts.length, 1);
+
+  const second = await postCommit(harness, "ambiguo-0001", before.body.revision);
+  assert.equal(second.response.status, 503);
+  // A garantia: insistir nao repete a acao.
+  assert.equal(harness.prompts.length, 1);
+
+  const status = await getTurnStatus(harness, "ambiguo-0001");
+  assert.equal(status.body.status, "done");
+  assert.equal(status.body.turn.status, 503);
+});
+
+// Downgrade: o v0.7 reenvia o mesmo id SEM `confirm`. Se a impressao digital ignorasse o
+// campo, ele receberia o corpo `200 staged` guardado, leria ok/sessionId/transcript e daria
+// a fala como entregue — sem nenhum prompt ter acontecido, e apagando o rascunho.
+test("cliente antigo não confunde uma transcrição retida com entrega", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const staged = await postTurn(harness, {
+    clientMsgId: "downgrade-0001",
+    expectedRevision: before.body.revision,
+    confirm: true,
+  });
+  assert.equal(staged.response.status, 200);
+
+  const legacy = await postTurn(harness, {
+    clientMsgId: "downgrade-0001",
+    expectedRevision: before.body.revision,
+  });
+  assert.equal(legacy.response.status, 409);
+  assert.match(legacy.body.error, /já foi utilizado/);
 });

@@ -510,3 +510,27 @@ test('turno esquecido apos restaurar cai num degrau valido da escada', () => {
   assert.equal(state.waitMs, RETRY_DELAYS[0])
   assert.equal(reduce(state, { kind: 'timer' }).phase, 'post')
 })
+
+// 5xx no commit e a unica ambiguidade real do fluxo: o RPC pode ter escrito antes de
+// estourar. Insistir sozinho arriscaria a Iris agir duas vezes sobre a mesma fala.
+test('commit ambiguo para e exige turno novo em vez de insistir', () => {
+  let state = reduce(stagedDraft(ANCHOR, 'apaga o evento de amanha'), { kind: 'manual' })
+  state = reduce(state, { kind: 'http', status: 502 })
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.reason, 'ambiguous')
+  assert.equal(reasonHeadline(state.reason), 'NÃO SEI SE ENTROU')
+  // Turno novo no reenvio: repetir o mesmo id poderia entregar a segunda vez.
+  assert.equal(state.needsRefresh, true)
+  assert.equal(state.clearDraft, false)
+})
+
+// Um 5xx GRAVADO pelo servidor e desfecho, nao falha de transporte. Devolver a fase 'ask'
+// aqui fazia a maquina perguntar, receber o mesmo 5xx e girar sem espera nenhuma.
+test('5xx guardado pelo servidor para, em vez de girar perguntando', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-done', turnStatus: 503, transcript: '' })
+  assert.notEqual(state.phase, 'ask')
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.reason, 'server')
+  assert.equal(state.clearDraft, false)
+})

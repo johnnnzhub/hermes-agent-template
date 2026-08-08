@@ -181,6 +181,8 @@ let busySince = 0
 let thinkingSince = 0
 // O rascunho chegou ao localStorage. Falso = so em memoria, e o HUD precisa avisar.
 let draftOnDisk = true
+// Pagina da transcricao em leitura na tela de confirmacao.
+let confirmPage = 0
 // Primeiro scroll para cima na tela de rascunho arma o descarte; o segundo confirma.
 let discardArmed = false
 let discardTimer: number | null = null
@@ -248,17 +250,38 @@ function retryContent(): string {
  * fez. Esta tela e a janela entre "o servidor entendeu" e "a Iris agiu" — a unica possivel,
  * porque antes do STT ninguem sabe o que foi dito.
  */
+const CONFIRM_BODY_LINES = 4
+
+/**
+ * A transcricao inteira, paginada. Cortar em quatro linhas era pior que nao confirmar: uma
+ * fala de 30 s passa de 400 caracteres, e o sufixo errado — justamente onde o STT mais erra
+ * — ficava fora da tela. O John tocaria dando OK num texto que nunca leu.
+ */
+function confirmPages(): string[][] {
+  const heard = sendState?.transcript || (pending ? draftSummary(pending) : '')
+  const lines = wrapHudText(`» ${heard}`)
+  const pages: string[][] = []
+  for (let index = 0; index < Math.max(lines.length, 1); index += CONFIRM_BODY_LINES) {
+    pages.push(lines.slice(index, index + CONFIRM_BODY_LINES))
+  }
+  return pages
+}
+
 function confirmContent(): string {
   if (!sendState || !pending) return emptyContent()
-  // O texto e o que o SERVIDOR entendeu, nunca o resumo do rascunho: confirmar sem ver a
-  // transcricao seria confirmar no escuro.
-  const heard = sendState.transcript || draftSummary(pending)
-  const lines = ['CONFIRMAR', ...wrapHudText(`» ${heard}`).slice(0, 4)]
+  const pages = confirmPages()
+  const index = Math.min(confirmPage, pages.length - 1)
+  const lines = [
+    pages.length > 1 ? `CONFIRMAR · ${index + 1}/${pages.length}` : 'CONFIRMAR',
+    ...pages[index],
+  ]
+  if (!draftOnDisk) lines.push('SÓ NESTA SESSÃO · NÃO FECHE')
   if (discardArmed) {
-    lines.push('ROLAR DE NOVO = APAGAR A FALA', 'TOQUE = ENVIAR')
+    lines.push('ROLAR DE NOVO = APAGAR A FALA')
     return lines.join('\n')
   }
-  lines.push('TOQUE = ENVIAR', 'ROLAR PRA CIMA = DESCARTAR')
+  lines.push('TOQUE = ENVIAR · CIMA = APAGAR')
+  if (pages.length > 1) lines.push('BAIXO = VER O RESTO')
   return lines.join('\n')
 }
 
@@ -556,6 +579,7 @@ function dropDraft() {
   sendState = null
   thinkingSince = 0
   draftOnDisk = true
+  confirmPage = 0
   disarmDiscard()
   clearWaitTimer()
   // Invalida qualquer continuacao de entrega ainda em voo.
@@ -697,6 +721,7 @@ function applySendOutcome() {
       draftOnDisk = savePendingTurn(pending)
     }
     thinkingSince = 0
+    confirmPage = 0
     mode = 'confirm'
     setStatus('listening', 'Confirmar envio')
     renderState()
@@ -1036,6 +1061,16 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       navigate(-1)
       return
     case 'scroll_down':
+      // Na confirmacao o scroll para baixo le o resto da frase, nao navega o historico:
+      // sem isso a transcricao longa era inalcancavel e o OK saia as cegas.
+      if (mode === 'confirm') {
+        const pages = confirmPages().length
+        if (pages > 1) {
+          confirmPage = (Math.min(confirmPage, pages - 1) + 1) % pages
+          renderState()
+        }
+        return
+      }
       navigate(1)
       return
     case 'double_click':
