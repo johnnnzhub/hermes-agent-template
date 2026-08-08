@@ -5,9 +5,10 @@
 // Quando o gargalo era o proprio upload, cada tentativa piorava o quadro e o HUD ficava
 // ~109 s em PENSANDO antes de admitir a falha.
 //
-// Aqui a regra e outra: falha de rede nunca reenvia o audio de cara, ela PERGUNTA. Um
-// GET /session custa ~200 bytes e responde a unica duvida que importa — o turno entrou
-// ou nao? So quando a sessao continua intacta e que vale gastar outro upload.
+// Aqui a regra e outra: falha de rede nunca reenvia o audio de cara, ela PERGUNTA. O GET
+// por id devolve algumas centenas de bytes e responde a unica duvida que importa — o turno
+// entrou ou nao? (O fallback por /session e maior: traz ate seis turnos.) So quando a
+// resposta diz que o servidor nunca viu o turno e que vale gastar outro upload.
 //
 // Reenviar e seguro por construcao: o servidor deduplica por clientMsgId + fingerprint
 // do audio, entao repetir a mesma tentativa devolve a promessa em voo ou o mesmo

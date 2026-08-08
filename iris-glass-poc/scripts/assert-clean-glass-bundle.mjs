@@ -30,7 +30,11 @@ const REQUIRED = [
   'OUVINDO',
   'PENSANDO',
   '/glass/hermes/session',
-  '/glass/hermes/turn',
+  // Regex, nao substring: "/glass/hermes/turn" tambem casa dentro de
+  // "/glass/hermes/turn/", entao a rota de ENVIO podia sumir do bundle com o gate verde —
+  // o `.ehpk` instalaria e toda gravacao levaria 404 no device. Exige a ocorrencia que
+  // NAO e seguida de barra, que e o POST.
+  /\/glass\/hermes\/turn(?![/\w])/,
   'hermes-g2.tail390702.ts.net:8443',
   'AGUARDANDO NO TERMINAL',
   // Contrato da v0.5.0: a fala capturada tem tela propria e saida por toque. Sem estas
@@ -46,6 +50,10 @@ const REQUIRED = [
   '/glass/hermes/turn/',
   '/glass/hermes/interrupt',
   'TOQUE PARA DESTRAVAR',
+  // Contrato da v0.7.2: apagar a fala exige dois gestos, e um rascunho que nao chegou ao
+  // disco precisa dizer isso em vez de se passar por recuperavel.
+  'ROLAR DE NOVO = APAGAR A FALA',
+  'SÓ NESTA SESSÃO · NÃO FECHE',
 ]
 
 const envKeys = ['VITE_GLASS_DIAG', 'VITE_HERMES_API_BASE']
@@ -91,7 +99,8 @@ for (const file of files) {
   }
 }
 for (const value of REQUIRED) {
-  if (!bundle.includes(value)) {
+  const present = value instanceof RegExp ? value.test(bundle) : bundle.includes(value)
+  if (!present) {
     console.error(`OBRIGATÓRIA: "${value}" ausente do dist`)
     failed = true
   }

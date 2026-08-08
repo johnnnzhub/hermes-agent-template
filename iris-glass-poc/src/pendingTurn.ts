@@ -39,10 +39,13 @@ export interface DraftStorage {
   removeItem(key: string): void
 }
 
-function appVersion(): string {
-  // __APP_VERSION__ e um define do Vite: existe no bundle, nao existe sob `node --test`.
-  return typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'test'
-}
+/**
+ * Versao do FORMATO, nao do app. Carimbar a versao do app aqui apagava o rascunho em toda
+ * atualizacao do plugin — justo o oposto do que o update in-place promete ao preservar o
+ * localStorage: o John instalaria a versao nova e perderia a fala pendente na primeira
+ * abertura. So sobe quando o shape de PendingTurn mudar de forma incompativel.
+ */
+const DRAFT_SCHEMA = 1
 
 export function defaultStorage(): DraftStorage | null {
   try {
@@ -112,7 +115,7 @@ export function savePendingTurn(
     return false
   }
   try {
-    storage.setItem(STORAGE_KEY, JSON.stringify({ v: appVersion(), turn }))
+    storage.setItem(STORAGE_KEY, JSON.stringify({ v: DRAFT_SCHEMA, turn }))
     return true
   } catch {
     clearPendingTurn(storage)
@@ -142,8 +145,9 @@ export function loadPendingTurn(
   }
 
   const envelope = parsed as { v?: unknown; turn?: unknown } | null
-  // Versao diferente: o formato pode ter mudado e o audio nao vale um palpite.
-  if (!envelope || envelope.v !== appVersion()) {
+  // Schema diferente: o formato mudou e o audio nao vale um palpite. Atualizar o plugin
+  // NAO cai aqui — o rascunho atravessa a atualizacao, que e o ponto do update in-place.
+  if (!envelope || envelope.v !== DRAFT_SCHEMA) {
     clearPendingTurn(storage)
     return null
   }

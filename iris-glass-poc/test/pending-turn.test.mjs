@@ -58,11 +58,25 @@ test('rascunho vencido nao volta e sai do disco', () => {
   assert.equal(storage.map.size, 0)
 })
 
-test('rascunho de outra versao do app e descartado em vez de adivinhado', () => {
+test('rascunho de outro schema e descartado em vez de adivinhado', () => {
   const storage = fakeStorage()
-  storage.map.set('hermes_pending_v1', JSON.stringify({ v: '0.0.0-antiga', turn: draft() }))
+  storage.map.set('hermes_pending_v1', JSON.stringify({ v: 99, turn: draft() }))
   assert.equal(loadPendingTurn(1_500, storage), null)
   assert.equal(storage.map.size, 0)
+})
+
+// O envelope carregava a versao do APP, entao atualizar o plugin apagava a fala pendente
+// na primeira abertura — o contrario do que o update in-place promete ao preservar o
+// localStorage. O carimbo e do formato, e o formato nao muda a cada release.
+test('rascunho atravessa uma atualizacao do plugin', () => {
+  const storage = fakeStorage()
+  const saved = draft()
+  assert.equal(savePendingTurn(saved, storage), true)
+  const envelope = JSON.parse(storage.map.get('hermes_pending_v1'))
+  assert.equal(typeof envelope.v, 'number')
+  const restored = loadPendingTurn(1_500, storage)
+  assert.equal(restored?.clientMsgId, saved.clientMsgId)
+  assert.equal(restored?.pcmB64, saved.pcmB64)
 })
 
 test('JSON corrompido no disco nao derruba a leitura', () => {

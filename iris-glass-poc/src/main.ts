@@ -177,6 +177,12 @@ let busySince = 0
 // sessao volta a idle: um rascunho sem desfecho com a sessao ociosa ficaria sem nenhum
 // relogio e o PENSANDO nao teria fim.
 let thinkingSince = 0
+// O rascunho chegou ao localStorage. Falso = so em memoria, e o HUD precisa avisar.
+let draftOnDisk = true
+// Primeiro scroll para cima na tela de rascunho arma o descarte; o segundo confirma.
+let discardArmed = false
+let discardTimer: number | null = null
+const DISCARD_ARM_MS = 6_000
 // O servidor conta ha quanto tempo o turno esta aberto; o teto local so vale como
 // fallback para backends que ainda nao reportam `stuck`.
 let remoteStuck = false
@@ -199,7 +205,9 @@ function workingContent(): string {
     return 'AGUARDANDO NO TERMINAL'
   }
   const base = progress?.kind === 'tool' ? progress.text.toUpperCase() : 'PENSANDO'
-  const label = thinkingLabel(base, elapsed)
+  // O nome da ferramenta vem do servidor com ate 80 caracteres, e o contador ainda soma
+  // ` · 120s` em cima: sem quebrar, a linha passava de 43 colunas e o resto sumia no HUD.
+  const label = wrapHudText(thinkingLabel(base, elapsed)).slice(0, 2).join('\n')
   // Eco do que o servidor entendeu: o transcript volta no 202 e ate a v0.4.3 era jogado
   // fora, entao a fala sumia da tela no instante em que era aceita.
   if (!echo) return label
@@ -218,12 +226,19 @@ function sendingContent(): string {
 
 function retryContent(): string {
   if (!sendState || !pending) return emptyContent()
-  return [
+  const lines = [
     reasonHeadline(sendState.reason),
     ...wrapHudText(`» ${draftSummary(pending)}`).slice(0, 3),
-    'TOQUE = REENVIAR',
-    'ROLAR PRA CIMA = DESCARTAR',
-  ].join('\n')
+  ]
+  // O disco recusou o rascunho (sem storage no WebView ou cota estourada). Ele existe so
+  // em memoria, entao fechar o app leva a fala junto — dizer isso e o minimo honesto.
+  if (!draftOnDisk) lines.push('SÓ NESTA SESSÃO · NÃO FECHE')
+  if (discardArmed) {
+    lines.push('ROLAR DE NOVO = APAGAR A FALA', 'TOQUE = REENVIAR')
+    return lines.join('\n')
+  }
+  lines.push('TOQUE = REENVIAR', 'ROLAR PRA CIMA = DESCARTAR')
+  return lines.join('\n')
 }
 
 function emptyContent(): string {
@@ -284,6 +299,30 @@ function showError(message: string) {
 }
 
 /**
+ * Teto do PENSANDO para o rascunho sem desfecho: devolve o rascunho ao John em vez de
+ * prometer resposta para sempre. Reenviar depois e deduplicado, entao parar nao perde nada.
+ *
+ * Vive FORA do reconcile porque aquele so roda depois de um GET /session bem-sucedido: com
+ * a rede inteira caida, todo poll falhava, o teto nunca era aplicado e o HUD voltava a
+ * PENSANDO eternamente — o sintoma exato que abriu esta frente, reintroduzido pelo proprio
+ * conserto dele.
+ *
+ * Nao se aplica com a sessao ocupada: ali existe um turno de verdade no servidor, e a
+ * saida certa e a tela de destravar, nao a de reenviar.
+ */
+function enforceDraftCeiling(): boolean {
+  if (!pending || !sendState || sendState.phase !== 'thinking') return false
+  if (remoteState !== 'idle') return false
+  if (!thinkingSince || Date.now() - thinkingSince <= THINKING_HARD_MS) return false
+  sendState = parkExhausted(sendState)
+  thinkingSince = 0
+  mode = 'retry'
+  setStatus('error', reasonHeadline(sendState.reason))
+  renderState()
+  return true
+}
+
+/**
  * Pos-condicao do envio ambiguo. Quando o POST morreu e o probe so viu a sessao mexida,
  * quem decide se a fala entrou e a sessao de volta em idle. Nada de apagar rascunho por
  * palpite. (A fase 2 troca isto por GET /glass/hermes/turn/:clientMsgId, que responde
@@ -297,15 +336,8 @@ function reconcilePending(snapshot: HermesSession) {
   // revision feita por OUTRO turno — e apagaria uma fala que o servidor talvez tenha
   // rejeitado com 409 ou 422.
   if (!sendState.inferable) {
+    if (enforceDraftCeiling()) return
     if (snapshot.state !== 'idle') return
-    // Teto do PENSANDO tambem para o rascunho sem desfecho: com a sessao ociosa e o
-    // servidor sem responder sobre este id, devolver o rascunho e mais honesto que
-    // prometer resposta para sempre. Reenviar depois e deduplicado, entao nada se perde.
-    if (thinkingSince && Date.now() - thinkingSince > THINKING_HARD_MS) {
-      sendState = parkExhausted(sendState)
-      thinkingSince = 0
-      return
-    }
     void resolvePendingById()
     return
   }
@@ -401,6 +433,10 @@ function schedulePoll() {
     pollTimer = null
     if (hudDead) return
     await refreshSession(true)
+    if (hudDead) return
+    // O teto vale mesmo quando o refresh acima falhou: e justamente com a rede caida que o
+    // rascunho ficava sem ninguem para encerrar a espera.
+    if (enforceDraftCeiling()) return
     if (remoteState !== 'idle' || draftAwaitingOutcome()) schedulePoll()
   }, pollDelay(pollElapsed()))
 }
@@ -472,10 +508,31 @@ function clearWaitTimer() {
   }
 }
 
+function disarmDiscard() {
+  discardArmed = false
+  if (discardTimer !== null) {
+    window.clearTimeout(discardTimer)
+    discardTimer = null
+  }
+}
+
+function armDiscard() {
+  disarmDiscard()
+  discardArmed = true
+  renderState()
+  discardTimer = window.setTimeout(() => {
+    discardTimer = null
+    discardArmed = false
+    if (!hudDead) renderState()
+  }, DISCARD_ARM_MS)
+}
+
 function dropDraft() {
   pending = null
   sendState = null
   thinkingSince = 0
+  draftOnDisk = true
+  disarmDiscard()
   clearWaitTimer()
   // Invalida qualquer continuacao de entrega ainda em voo.
   sendGen++
@@ -493,7 +550,9 @@ function adoptDraft(pcm: Uint8Array, durMs: number): PendingTurn {
     submitted: false,
     turnsAtSubmit: turns.length,
   }
-  savePendingTurn(turn)
+  // O retorno importa: disco recusado significa que a fala existe so em RAM e some se o
+  // app fechar. Ignorar isso deixava o HUD prometer um rascunho recuperavel que nao era.
+  draftOnDisk = savePendingTurn(turn)
   return turn
 }
 
@@ -643,6 +702,14 @@ async function resolvePendingById() {
   // tenham exatamente o mesmo tratamento do laco de entrega — inclusive a escada, que
   // termina parando com o rascunho guardado em vez de perguntar para sempre.
   sendState = reduce({ ...sendState, phase: 'ask' }, event)
+  // Fase que pede outra rodada de rede volta para o laco de entrega, que sabe percorre-la.
+  // Hoje o servidor apaga a entrada de dedupe em 5xx, entao um `done` com 5xx — a unica
+  // reducao daqui que devolveria 'ask' — nao chega a existir; depender disso para o app
+  // nao travar seria acoplar a totalidade do cliente a um detalhe do servidor.
+  if (sendState.phase === 'ask' || sendState.phase === 'probe' || sendState.phase === 'post') {
+    void deliverPending()
+    return
+  }
   applySendOutcome()
 }
 
@@ -683,6 +750,7 @@ async function deliverPending() {
 function retryNow() {
   if (!pending || !sendState) return
   if (sendState.phase !== 'retry' && sendState.phase !== 'wait') return
+  disarmDiscard()
   clearWaitTimer()
   sendGen++
   let next = reduce(sendState, { kind: 'manual' })
@@ -696,7 +764,7 @@ function retryNow() {
       turnsAtSubmit: turns.length,
       attempts: 0,
     }
-    savePendingTurn(pending)
+    draftOnDisk = savePendingTurn(pending)
     next = startSend(revision)
   }
   sendState = next
@@ -750,6 +818,8 @@ function restoreDraft() {
   // sem aviso seria surpresa. Fica oferecido ate o toque.
   pending = saved
   sendState = parkedDraft(saved.expectedRevision)
+  // Veio do disco, entao esta no disco.
+  draftOnDisk = true
   mode = 'retry'
   renderState()
 }
@@ -871,6 +941,13 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       return
     case 'scroll_up':
       if (mode === 'retry') {
+        // Descartar e a UNICA acao irreversivel do app, e apaga a unica copia de uma fala
+        // que o servidor talvez nunca tenha recebido. Um esbarrao nao pode bastar: o
+        // primeiro gesto arma, o segundo confirma, e a janela expira sozinha.
+        if (!discardArmed) {
+          armDiscard()
+          return
+        }
         discardDraft()
         return
       }

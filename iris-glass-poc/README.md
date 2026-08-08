@@ -38,8 +38,9 @@ call, so a failed or hanging submit can no longer take the recording with it.
   permanent `busy` was restarting the container. The 4-minute local ceiling
   still applies when the server does not report `stuck`. Polling backs off from
   1.2 s to 3 s to 8 s.
-- Only "no speech" (422), "audio too long" (413), and a rejected payload (400)
-  discard the recording — nothing else does.
+- Only "no speech" (422) and "audio too long" (413) discard the recording.
+  Every other status — including 400 and any transient 408/425/429 — parks with
+  the draft intact, because a resend would have delivered it.
 
 The display exposes conversation text plus safe progress (`Pensando`,
 `Usando <ferramenta>`, or `Aguardando no Terminal Mode`). Tool arguments,
