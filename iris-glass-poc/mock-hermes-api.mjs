@@ -14,6 +14,11 @@ let busyUntil = 0
 //   GET /mock/fail?mode=hang  troca em tempo de execucao
 let failMode = process.env.HERMES_MOCK_FAIL || 'none'
 let posts = 0
+// HERMES_MOCK_LEGACY=1 finge um backend anterior a 2026-08-08: sem a rota de status por
+// id. E o cenario de version skew que o cliente precisa atravessar sem perder a fala.
+const legacy = process.env.HERMES_MOCK_LEGACY === '1'
+// Espelha o mapa de deduplicacao do servidor real: id -> resultado (ou null em voo).
+const turnResults = new Map()
 
 function send(response, status, body) {
   response.writeHead(status, {
@@ -60,25 +65,56 @@ createServer((request, response) => {
     })
   }
 
+  if (request.method === 'GET' && url.pathname.startsWith('/glass/hermes/turn/')) {
+    if (legacy) return send(response, 404, { error: 'Not found' })
+    const clientMsgId = decodeURIComponent(url.pathname.slice('/glass/hermes/turn/'.length))
+    if (!turnResults.has(clientMsgId)) return send(response, 200, { ok: true, status: 'unknown' })
+    const result = turnResults.get(clientMsgId)
+    if (!result) return send(response, 200, { ok: true, status: 'pending' })
+    return send(response, 200, { ok: true, status: 'done', turn: result })
+  }
+
   if (request.method === 'POST' && url.pathname === '/glass/hermes/turn') {
     let raw = ''
     request.on('data', chunk => { raw += chunk })
     request.on('end', () => {
       posts++
+      const body = JSON.parse(raw || '{}')
+      // "flaky" simula o upload que morre no caminho: o servidor nunca soube do turno,
+      // entao o status por id responde "unknown" e reenviar e o certo. Diferente de
+      // "hang", em que o servidor RECEBEU e travou depois — ai reenviar seria duplicar.
+      const dropped = failMode === 'flaky' && posts === 1
+      if (dropped) {
+        console.log(`POST #${posts} descartado antes de registrar (upload perdido)`)
+        return
+      }
+      // O servidor real registra o id ANTES da transcricao, entao o status por id ja
+      // responde "pending" enquanto o POST ainda esta em voo.
+      if (body.clientMsgId && !turnResults.has(body.clientMsgId)) {
+        turnResults.set(body.clientMsgId, null)
+      }
+
+      const finish = (status, payload) => {
+        if (body.clientMsgId) {
+          if (status >= 500) turnResults.delete(body.clientMsgId)
+          else turnResults.set(body.clientMsgId, { status, body: payload })
+        }
+        send(response, status, payload)
+      }
+
       // "hang" nunca responde: e o cenario que fazia o HUD ficar em PENSANDO ate o erro.
-      if (failMode === 'hang' || (failMode === 'flaky' && posts === 1)) {
+      if (failMode === 'hang') {
         console.log(`POST #${posts} pendurado de proposito`)
         return
       }
       const status = Number(failMode)
       if (Number.isFinite(status) && status >= 400) {
-        return send(response, status, { error: `falha simulada ${status}` })
+        return finish(status, { error: `falha simulada ${status}` })
       }
 
-      const body = JSON.parse(raw || '{}')
       if (!body.clientMsgId || !body.pcmB64) return send(response, 400, { error: 'Áudio inválido' })
       if (body.expectedRevision && body.expectedRevision !== revision()) {
-        return send(response, 409, { error: 'A conversa mudou; atualize antes de enviar.' })
+        return finish(409, { error: 'A conversa mudou; atualize antes de enviar.' })
       }
       turns.push({
         id: body.clientMsgId,
@@ -86,7 +122,7 @@ createServer((request, response) => {
         assistant: 'Resposta simulada do HERMES.',
       })
       busyUntil = Date.now() + 2_000
-      send(response, 202, {
+      finish(202, {
         ok: true,
         sessionId: 'mock-hermes-session',
         clientMsgId: body.clientMsgId,

@@ -1,4 +1,5 @@
 const SESSION_TIMEOUT_MS = 12_000
+const STATUS_TIMEOUT_MS = 8_000
 // 45 s, nao 35 s: o servidor pode gastar ate 30 s so de STT, mais dois snapshots da
 // sessao e o prompt.submit por RPC. Abortar em 35 s era desistir de um turno que o
 // backend estava prestes a aceitar — e a tentativa seguinte reenviava 1,28 MB a toa.
@@ -19,11 +20,21 @@ export interface HermesSession {
   sessionId: string
   revision: string
   state: 'idle' | 'busy' | 'awaiting'
+  /** O servidor considera o turno travado. Ausente em backends anteriores a 2026-08-08. */
+  stuck: boolean
   progress: HermesProgress | null
   turns: HermesTurn[]
   cursor: number
   nextCursor: number | null
 }
+
+/** Resposta de GET /turn/:clientMsgId, ja normalizada. */
+export type TurnStatus =
+  | { kind: 'unknown' }
+  | { kind: 'pending' }
+  | { kind: 'done'; status: number; transcript: string }
+  /** Rota ausente ou inalcancavel: usar o caminho antigo, que infere pela sessao. */
+  | { kind: 'unavailable' }
 
 export interface VoiceTurnRequest {
   pcmB64: string
@@ -149,6 +160,7 @@ function normalizedSession(raw: unknown): HermesSession {
     sessionId: data.sessionId,
     revision: String(data.revision),
     state: data.state as HermesSession['state'],
+    stuck: data.stuck === true,
     progress,
     turns,
     cursor: Number.isInteger(data.cursor) ? Number(data.cursor) : 0,
@@ -187,6 +199,49 @@ export async function fetchHermesSession(cursor = 0): Promise<HermesSession> {
 // clientMsgId + fingerprint do audio e devolve o mesmo resultado, nunca um turno a mais.
 // `status === 0` e a marca de falha de rede/timeout — e o que separa "nao chegou" de
 // "chegou e o servidor recusou".
+// Pergunta pelo turno em vez de reenviar o audio. ~200 bytes contra ~1,28 MB.
+//
+// A distincao entre "o servidor nunca viu este id" (200 unknown) e "esta rota nao existe
+// aqui" (404) e o contrato inteiro: a primeira autoriza reenviar, a segunda manda usar o
+// caminho antigo. Nunca tratar as duas como a mesma coisa.
+export async function fetchTurnStatus(clientMsgId: string): Promise<TurnStatus> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/turn/${encodeURIComponent(clientMsgId)}`,
+      { headers: authHeaders() },
+      STATUS_TIMEOUT_MS,
+    )
+    if (!response.ok) return { kind: 'unavailable' }
+    const body = await response.json()
+    if (body?.ok !== true) return { kind: 'unavailable' }
+    if (body.status === 'unknown') return { kind: 'unknown' }
+    if (body.status === 'pending') return { kind: 'pending' }
+    if (body.status === 'done' && Number.isFinite(body.turn?.status)) {
+      const transcript = typeof body.turn?.body?.transcript === 'string'
+        ? body.turn.body.transcript
+        : ''
+      return { kind: 'done', status: Number(body.turn.status), transcript }
+    }
+    return { kind: 'unavailable' }
+  } catch {
+    return { kind: 'unavailable' }
+  }
+}
+
+/** Solta um turno que o agente nao fecha sozinho. False quando a rota nao existe. */
+export async function interruptHermes(): Promise<boolean> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/interrupt`,
+      { method: 'POST', headers: authHeaders() },
+      SESSION_TIMEOUT_MS,
+    )
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
 export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTurnAccepted> {
   try {
     const response = await fetchWithTimeout(

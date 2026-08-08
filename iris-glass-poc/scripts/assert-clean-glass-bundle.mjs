@@ -41,6 +41,11 @@ const REQUIRED = [
   'TOQUE = REENVIAR',
   'ROLAR PRA CIMA = DESCARTAR',
   'SEM RESPOSTA',
+  // Contrato da v0.6.0: perguntar pelo turno em vez de reenviar o audio, e soltar um
+  // turno travado sem reiniciar o container.
+  '/glass/hermes/turn/',
+  '/glass/hermes/interrupt',
+  'TOQUE PARA DESTRAVAR',
 ]
 
 const envKeys = ['VITE_GLASS_DIAG', 'VITE_HERMES_API_BASE']

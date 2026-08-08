@@ -434,7 +434,11 @@ export function createGlassConversationRouter({
     }
     const entry = dedupe.get(clientMsgId);
     if (!entry) {
-      res.status(404).json({ error: "Turno desconhecido" });
+      // 200 "unknown", nao 404: o catch-all deste router tambem responde 404, e o cliente
+      // precisa separar "o servidor nunca viu este id" (reenviar) de "esta rota nao foi
+      // promovida" (usar o caminho antigo). Foi confundir resposta HTTP com ausencia de
+      // rota que custou quase uma hora de diagnostico em 2026-08-03.
+      res.json({ ok: true, status: "unknown" });
       return;
     }
     if (!entry.result) {

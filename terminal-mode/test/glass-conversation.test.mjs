@@ -301,8 +301,16 @@ test("turn status answers by id instead of forcing another audio upload", async 
   t.after(() => harness.closeHttp());
   const before = await getSession(harness);
 
+  // "id desconhecido" NAO pode ser 404: o catch-all do router responde 404 tambem, e o
+  // cliente precisa separar isso de "a rota nao foi promovida".
   const unknown = await getTurnStatus(harness, "nunca-vi-este-id");
-  assert.equal(unknown.response.status, 404);
+  assert.equal(unknown.response.status, 200);
+  assert.equal(unknown.body.status, "unknown");
+
+  const missingRoute = await fetch(`${harness.baseUrl}/glass/hermes/inexistente`, {
+    headers: glassHeaders(),
+  });
+  assert.equal(missingRoute.status, 404);
 
   const malformed = await getTurnStatus(harness, "curto");
   assert.equal(malformed.response.status, 400);

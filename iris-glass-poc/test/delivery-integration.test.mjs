@@ -10,16 +10,28 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { MAX_POSTS, RETRY_DELAYS, reduce, startSend } from '../src/sendMachine.ts'
+import {
+  ASK_DELAYS,
+  MAX_POSTS,
+  RETRY_DELAYS,
+  reduce,
+  startSend,
+} from '../src/sendMachine.ts'
 
 const MOCK = join(dirname(fileURLToPath(import.meta.url)), '..', 'mock-hermes-api.mjs')
 // Curto de proposito: o valor real (45 s) esta em glassApi.ts; aqui o que importa e o
 // comportamento depois do estouro, nao o numero.
 const TIMEOUT_MS = 300
 
-async function startMock(failMode, port) {
+async function startMock(failMode, port, legacy = false) {
   const child = spawn(process.execPath, [MOCK], {
-    env: { ...process.env, HERMES_API_PORT: String(port), HERMES_MOCK_FAIL: failMode, GLASS_TOKEN: '' },
+    env: {
+      ...process.env,
+      HERMES_API_PORT: String(port),
+      HERMES_MOCK_FAIL: failMode,
+      HERMES_MOCK_LEGACY: legacy ? '1' : '0',
+      GLASS_TOKEN: '',
+    },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   await once(child.stdout, 'data')
@@ -65,12 +77,37 @@ async function probe(port) {
   }
 }
 
+async function ask(port, clientMsgId) {
+  try {
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${port}/glass/hermes/turn/${clientMsgId}`,
+      {},
+      2_000,
+    )
+    if (!response.ok) return { kind: 'status-unavailable' }
+    const body = await response.json()
+    if (body.status === 'unknown') return { kind: 'status-unknown' }
+    if (body.status === 'pending') return { kind: 'status-pending' }
+    if (body.status === 'done') {
+      return {
+        kind: 'status-done',
+        turnStatus: body.turn.status,
+        transcript: body.turn.body?.transcript ?? '',
+      }
+    }
+    return { kind: 'status-unavailable' }
+  } catch {
+    return { kind: 'status-unavailable' }
+  }
+}
+
 /** Roda a entrega inteira sem dormir de verdade: o degrau da escada vira um `timer`. */
 async function deliver(port, draft) {
   let state = startSend(draft.expectedRevision)
   const waits = []
   for (let guard = 0; guard < 32; guard++) {
     if (state.phase === 'post') state = reduce(state, await postTurn(port, draft))
+    else if (state.phase === 'ask') state = reduce(state, await ask(port, draft.clientMsgId))
     else if (state.phase === 'probe') state = reduce(state, await probe(port))
     else if (state.phase === 'wait') {
       waits.push(state.waitMs)
@@ -80,8 +117,8 @@ async function deliver(port, draft) {
   return { state, waits }
 }
 
-async function scenario(failMode, port, run) {
-  const child = await startMock(failMode, port)
+async function scenario(failMode, port, run, legacy = false) {
+  const child = await startMock(failMode, port, legacy)
   try {
     return await run()
   } finally {
@@ -114,27 +151,67 @@ test('caminho feliz: o 202 encerra a entrega e libera o rascunho', async () => {
   })
 })
 
-test('servidor que pendura esgota a escada e devolve o rascunho intacto', async () => {
+// O cenario exato do relato: o servidor aceita o POST e nunca responde.
+test('servidor que pendura nao reenvia o audio e mantem o rascunho', async () => {
   const port = 8792
   await scenario('hang', port, async () => {
     const before = await readSession(port)
     const { state, waits } = await deliver(port, draftFor(before.revision))
 
-    assert.equal(state.phase, 'retry')
-    assert.equal(state.reason, 'exhausted')
+    // O servidor confirma que TEM o turno, entao o cliente insiste barato e para de
+    // gastar upload: um POST so, contra os quatro da v0.4.3.
+    assert.equal(state.attempts, 1)
+    assert.deepEqual(waits, ASK_DELAYS)
+    assert.equal(state.phase, 'thinking')
     // O ponto do bug: a fala continua recuperavel.
     assert.equal(state.clearDraft, false)
-    assert.equal(state.attempts, MAX_POSTS)
-    assert.deepEqual(waits, RETRY_DELAYS)
-
-    // E a sessao no servidor nao mexeu — nada entrou, entao reenviar e legitimo.
-    const after = await readSession(port)
-    assert.equal(after.revision, before.revision)
-    assert.equal(after.turns.length, before.turns.length)
   })
 })
 
-test('rede intermitente se resolve sozinha na segunda tentativa', async () => {
+// Version skew: cliente novo contra o backend que ainda nao tem a rota de status.
+test('sem a rota de status o cliente cai na escada antiga, ainda sem perder a fala', async () => {
+  const port = 8797
+  await scenario(
+    'hang',
+    port,
+    async () => {
+      const before = await readSession(port)
+      const { state, waits } = await deliver(port, draftFor(before.revision))
+
+      assert.equal(state.phase, 'retry')
+      assert.equal(state.reason, 'exhausted')
+      assert.equal(state.clearDraft, false)
+      assert.equal(state.attempts, MAX_POSTS)
+      assert.deepEqual(waits, RETRY_DELAYS)
+
+      // E a sessao no servidor nao mexeu — nada entrou, entao reenviar e legitimo.
+      const after = await readSession(port)
+      assert.equal(after.revision, before.revision)
+      assert.equal(after.turns.length, before.turns.length)
+    },
+    true,
+  )
+})
+
+test('o desfecho do turno fica recuperavel por id depois de entregue', async () => {
+  const port = 8798
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    assert.deepEqual(await ask(port, 'teste-integracao-1'), { kind: 'status-unknown' })
+
+    await deliver(port, draftFor(before.revision))
+
+    // Uma resposta de ~200 bytes conta o mesmo que o POST de ~1,28 MB teria contado.
+    const status = await ask(port, 'teste-integracao-1')
+    assert.equal(status.kind, 'status-done')
+    assert.equal(status.turnStatus, 202)
+    assert.equal(status.transcript, 'Mensagem de voz simulada')
+  })
+})
+
+// Upload que morre no caminho: o servidor nunca soube do turno, entao reenviar e o certo
+// — e e o unico caso em que o audio sobe de novo.
+test('upload perdido se resolve sozinho na segunda tentativa', async () => {
   const port = 8793
   await scenario('flaky', port, async () => {
     const before = await readSession(port)

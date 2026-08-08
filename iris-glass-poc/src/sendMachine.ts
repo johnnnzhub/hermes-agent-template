@@ -16,7 +16,9 @@
 export type SendPhase =
   /** Fazer o POST /turn. */
   | 'post'
-  /** Fazer o GET /session e descobrir se o turno entrou. */
+  /** Perguntar por id: GET /turn/:clientMsgId. Resposta definitiva, ~200 bytes. */
+  | 'ask'
+  /** Fallback do `ask`: GET /session, quando a rota por id nao existe no servidor. */
   | 'probe'
   /** Esperar `waitMs` antes do proximo POST. */
   | 'wait'
@@ -43,7 +45,11 @@ export interface SendState {
   phase: SendPhase
   /** POSTs ja realizados. */
   attempts: number
+  /** Perguntas por id ja feitas enquanto o servidor respondia "pending". */
+  asks: number
   waitMs: number
+  /** Para onde o `wait` volta quando o tempo passa. */
+  waitNext: 'post' | 'ask'
   reason: SendReason
   transcript: string
   /** Revision da conversa no instante do envio; referencia do probe. */
@@ -58,6 +64,14 @@ export type SendEvent =
   | { kind: 'accepted'; transcript: string }
   | { kind: 'http'; status: number }
   | { kind: 'network' }
+  /** O servidor nunca viu este clientMsgId: o turno realmente nao chegou. */
+  | { kind: 'status-unknown' }
+  /** O servidor tem o id e ainda esta trabalhando nele. */
+  | { kind: 'status-pending' }
+  /** O servidor ja concluiu este id; `turnStatus` e o que o POST teria devolvido. */
+  | { kind: 'status-done'; turnStatus: number; transcript: string }
+  /** Rota por id ausente ou inalcancavel: cai para o probe da sessao. */
+  | { kind: 'status-unavailable' }
   | { kind: 'probe'; state: 'idle' | 'busy' | 'awaiting'; revision: string }
   | { kind: 'probe-failed' }
   /** O `wait` terminou. */
@@ -67,11 +81,16 @@ export type SendEvent =
 
 export const RETRY_DELAYS = [5_000, 15_000, 40_000]
 export const MAX_POSTS = RETRY_DELAYS.length + 1
+// Perguntar por id e barato, entao insiste mais e mais rapido que a escada de upload.
+export const ASK_DELAYS = [2_000, 4_000, 8_000, 15_000]
+export const MAX_ASKS = ASK_DELAYS.length
 
 const BASE: SendState = {
   phase: 'post',
   attempts: 0,
+  asks: 0,
   waitMs: 0,
+  waitNext: 'post',
   reason: 'none',
   transcript: '',
   anchorRevision: '',
@@ -100,21 +119,49 @@ function discard(state: SendState, reason: SendReason): SendState {
   return { ...state, phase: 'discarded', waitMs: 0, reason, clearDraft: true }
 }
 
-/** Falha reciclavel: pergunta antes de gastar outro upload. */
-function toProbe(state: SendState, reason: SendReason): SendState {
-  return { ...state, phase: 'probe', waitMs: 0, reason }
+function accept(state: SendState, transcript: string): SendState {
+  return {
+    ...state,
+    phase: 'thinking',
+    waitMs: 0,
+    reason: 'none',
+    transcript,
+    clearDraft: true,
+  }
 }
 
-/** Depois do probe inconclusivo: espera o degrau da escada, ou desiste. */
+/** Falha reciclavel: pergunta antes de gastar outro upload. */
+function toAsk(state: SendState, reason: SendReason): SendState {
+  return { ...state, phase: 'ask', waitMs: 0, reason }
+}
+
+/** Depois de uma resposta inconclusiva: espera o degrau da escada, ou desiste. */
 function afterInconclusiveProbe(state: SendState): SendState {
   if (state.attempts >= MAX_POSTS) return park(state, 'exhausted')
   const waitMs = RETRY_DELAYS[Math.min(state.attempts - 1, RETRY_DELAYS.length - 1)]
-  return { ...state, phase: 'wait', waitMs }
+  return { ...state, phase: 'wait', waitMs, waitNext: 'post' }
+}
+
+/** O servidor confirmou que tem o id: insiste barato antes de dar o turno como em curso. */
+function afterPendingAsk(state: SendState): SendState {
+  const asks = state.asks + 1
+  if (asks > MAX_ASKS) {
+    // O servidor tem o turno; quem mostra o desfecho e o poll. O rascunho continua
+    // guardado ate a pos-condicao confirmar a entrega.
+    return { ...state, phase: 'thinking', waitMs: 0, asks, reason: 'none' }
+  }
+  return {
+    ...state,
+    phase: 'wait',
+    waitMs: ASK_DELAYS[Math.min(asks - 1, ASK_DELAYS.length - 1)],
+    waitNext: 'ask',
+    asks,
+  }
 }
 
 function fromHttp(state: SendState, status: number): SendState {
   // 5xx e retentavel: pode ser o gateway reiniciando no meio do turno.
-  if (status >= 500) return toProbe(state, 'server')
+  if (status >= 500) return toAsk(state, 'server')
   if (status === 401 || status === 403) return park(state, 'auth')
   // Rota ausente: backend desatualizado ou nao promovido. Nada melhora com retry
   // automatico, mas o rascunho fica — basta o backend voltar (incidente 2026-08-03).
@@ -143,18 +190,23 @@ export function reduce(state: SendState, event: SendEvent): SendState {
   switch (state.phase) {
     case 'post': {
       const posted = { ...state, attempts: state.attempts + 1 }
-      if (event.kind === 'accepted') {
-        return {
-          ...posted,
-          phase: 'thinking',
-          waitMs: 0,
-          reason: 'none',
-          transcript: event.transcript,
-          clearDraft: true,
-        }
-      }
+      if (event.kind === 'accepted') return accept(posted, event.transcript)
       if (event.kind === 'http') return fromHttp(posted, event.status)
-      if (event.kind === 'network') return toProbe(posted, 'network')
+      if (event.kind === 'network') return toAsk(posted, 'network')
+      return state
+    }
+
+    case 'ask': {
+      // Resposta definitiva do servidor sobre ESTE id — nao inferencia sobre a sessao.
+      if (event.kind === 'status-done') {
+        if (event.turnStatus === 202) return accept(state, event.transcript)
+        return fromHttp(state, event.turnStatus)
+      }
+      if (event.kind === 'status-pending') return afterPendingAsk(state)
+      if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
+      // Rota ausente (servidor anterior a esta versao) ou inalcancavel: o caminho antigo,
+      // que infere pela revision da sessao, continua valendo.
+      if (event.kind === 'status-unavailable') return { ...state, phase: 'probe', waitMs: 0 }
       return state
     }
 
@@ -172,7 +224,7 @@ export function reduce(state: SendState, event: SendEvent): SendState {
     }
 
     case 'wait': {
-      if (event.kind === 'timer') return { ...state, phase: 'post', waitMs: 0 }
+      if (event.kind === 'timer') return { ...state, phase: state.waitNext, waitMs: 0 }
       return state
     }
 

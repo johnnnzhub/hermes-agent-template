@@ -8,6 +8,8 @@ import { classifyGlassEvent, summarizeGlassEvent } from './glassEvents'
 import {
   ApiError,
   fetchHermesSession,
+  fetchTurnStatus,
+  interruptHermes,
   newMsgId,
   sendVoiceTurn,
   type HermesProgress,
@@ -166,6 +168,10 @@ let delivering = false
 let lastProbe: HermesSession | null = null
 // Inicio do periodo ocupado, para o contador e para o teto do PENSANDO.
 let busySince = 0
+// O servidor conta ha quanto tempo o turno esta aberto; o teto local so vale como
+// fallback para backends que ainda nao reportam `stuck`.
+let remoteStuck = false
+let unsticking = false
 // O que o servidor entendeu da fala, devolvido pelo 202.
 let echo = ''
 
@@ -173,9 +179,13 @@ function busyElapsed(): number {
   return busySince ? Date.now() - busySince : 0
 }
 
+function isStuck(): boolean {
+  return remoteStuck || isThinkingStuck(busyElapsed())
+}
+
 function workingContent(): string {
   const elapsed = busyElapsed()
-  if (isThinkingStuck(elapsed)) return 'SEM RESPOSTA\nTOQUE PARA ATUALIZAR'
+  if (isStuck()) return 'SEM RESPOSTA\nTOQUE PARA DESTRAVAR'
   if (remoteState === 'awaiting' || progress?.kind === 'awaiting') {
     return 'AGUARDANDO NO TERMINAL'
   }
@@ -294,6 +304,7 @@ function applySession(snapshot: HermesSession, focusLatest: boolean) {
   if (focusLatest) pageIndex = latestTurnFirstPage(pages)
   else pageIndex = Math.min(pageIndex, Math.max(0, pages.length - 1))
 
+  remoteStuck = snapshot.stuck
   if (snapshot.state === 'idle') {
     busySince = 0
     echo = ''
@@ -453,6 +464,16 @@ async function postTurn(turn: PendingTurn): Promise<SendEvent> {
   }
 }
 
+async function askTurn(turn: PendingTurn): Promise<SendEvent> {
+  const status = await fetchTurnStatus(turn.clientMsgId)
+  if (status.kind === 'done') {
+    return { kind: 'status-done', turnStatus: status.status, transcript: status.transcript }
+  }
+  if (status.kind === 'pending') return { kind: 'status-pending' }
+  if (status.kind === 'unknown') return { kind: 'status-unknown' }
+  return { kind: 'status-unavailable' }
+}
+
 async function probeSession(): Promise<SendEvent> {
   try {
     const snapshot = await fetchHermesSession()
@@ -522,6 +543,8 @@ async function deliverPending() {
         mode = 'sending'
         renderState()
         sendState = reduce(sendState, await postTurn(pending))
+      } else if (sendState.phase === 'ask') {
+        sendState = reduce(sendState, await askTurn(pending))
       } else if (sendState.phase === 'probe') {
         sendState = reduce(sendState, await probeSession())
       } else if (sendState.phase === 'wait') {
@@ -565,6 +588,22 @@ function retryNow() {
   mode = 'sending'
   renderState()
   void deliverPending()
+}
+
+async function unstick() {
+  if (unsticking || hudDead) return
+  unsticking = true
+  setStatus('connecting', 'Interrompendo')
+  try {
+    // Falso quando a rota nao existe no servidor: o refresh a seguir ainda vale como
+    // tentativa honesta de reler o estado real.
+    await interruptHermes()
+  } finally {
+    unsticking = false
+  }
+  remoteStuck = false
+  busySince = 0
+  await refreshSession(true)
 }
 
 function discardDraft() {
@@ -690,9 +729,10 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
         retryNow()
         return
       }
-      // Passou do teto do PENSANDO: o toque busca a verdade em vez de gravar por cima.
-      if (remoteState !== 'idle' && isThinkingStuck(busyElapsed())) {
-        void refreshSession(true)
+      // Turno travado: o toque solta a sessao em vez de gravar por cima. Sem isto, o
+      // unico jeito de sair de um `busy` permanente era reiniciar o container.
+      if (remoteState !== 'idle' && isStuck()) {
+        void unstick()
         return
       }
       void beginRecording()

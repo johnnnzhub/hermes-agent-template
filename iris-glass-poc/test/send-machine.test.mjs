@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  ASK_DELAYS,
+  MAX_ASKS,
   MAX_POSTS,
   RETRY_DELAYS,
   parkedDraft,
@@ -14,6 +16,21 @@ const ANCHOR = 'a'.repeat(16)
 
 const start = () => startSend(ANCHOR)
 
+/** Falha de rede contra um backend sem a rota de status: cai no probe da sessao. */
+function legacyAsk(state) {
+  return reduce(reduce(state, { kind: 'network' }), { kind: 'status-unavailable' })
+}
+
+function exhaustLegacyLadder() {
+  let state = start()
+  for (let post = 0; post < MAX_POSTS; post++) {
+    state = legacyAsk(state)
+    state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
+    if (state.phase === 'wait') state = reduce(state, { kind: 'timer' })
+  }
+  return state
+}
+
 test('o 202 encerra a entrega e libera o rascunho', () => {
   const state = reduce(start(), { kind: 'accepted', transcript: 'bom dia' })
   assert.equal(state.phase, 'thinking')
@@ -24,15 +41,77 @@ test('o 202 encerra a entrega e libera o rascunho', () => {
 
 // O ponto central da correcao: falha de rede PERGUNTA (~200 bytes) antes de gastar
 // outro upload de ~1,28 MB.
-test('falha de rede vai para o probe, nunca direto para outro POST', () => {
+test('falha de rede pergunta pelo id, nunca vai direto para outro POST', () => {
   const state = reduce(start(), { kind: 'network' })
-  assert.equal(state.phase, 'probe')
+  assert.equal(state.phase, 'ask')
   assert.equal(state.reason, 'network')
   assert.equal(state.attempts, 1)
 })
 
-test('probe com a sessao intacta agenda o degrau seguinte da escada', () => {
+test('o servidor confirmando o turno encerra a entrega sem reenviar nada', () => {
   let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-done', turnStatus: 202, transcript: 'bom dia' })
+  assert.equal(state.phase, 'thinking')
+  assert.equal(state.clearDraft, true)
+  assert.equal(state.transcript, 'bom dia')
+  // O audio subiu uma vez so.
+  assert.equal(state.attempts, 1)
+})
+
+test('o desfecho guardado pelo servidor vale como resposta do POST', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-done', turnStatus: 409, transcript: '' })
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.reason, 'conflict')
+  assert.equal(state.clearDraft, false)
+})
+
+test('"nunca vi este id" e o unico caso que autoriza reenviar o audio', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-unknown' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'post')
+  assert.equal(state.waitMs, RETRY_DELAYS[0])
+  assert.equal(reduce(state, { kind: 'timer' }).phase, 'post')
+})
+
+test('turno em voo insiste barato em vez de reenviar', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-pending' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'ask')
+  assert.equal(state.waitMs, ASK_DELAYS[0])
+  assert.equal(reduce(state, { kind: 'timer' }).phase, 'ask')
+  assert.equal(state.attempts, 1)
+})
+
+test('insistir tem fim: o servidor tem o turno, entao vira PENSANDO com rascunho guardado', () => {
+  let state = reduce(start(), { kind: 'network' })
+  const waits = []
+  for (let ask = 0; ask <= MAX_ASKS; ask++) {
+    state = reduce(state, { kind: 'status-pending' })
+    if (state.phase === 'wait') {
+      waits.push(state.waitMs)
+      state = reduce(state, { kind: 'timer' })
+    }
+  }
+  assert.deepEqual(waits, ASK_DELAYS)
+  assert.equal(state.phase, 'thinking')
+  assert.equal(state.clearDraft, false)
+  assert.equal(state.attempts, 1)
+})
+
+// Version skew: o cliente novo tem de atravessar um backend antigo sem perder a fala.
+// Confundir "resposta HTTP" com "rota ausente" custou quase uma hora em 2026-08-03.
+test('rota de status ausente cai no caminho antigo em vez de falhar', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-unavailable' })
+  assert.equal(state.phase, 'probe')
+  assert.equal(state.attempts, 1)
+})
+
+test('probe com a sessao intacta agenda o degrau seguinte da escada', () => {
+  let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
   assert.equal(state.phase, 'wait')
   assert.equal(state.waitMs, RETRY_DELAYS[0])
@@ -40,39 +119,34 @@ test('probe com a sessao intacta agenda o degrau seguinte da escada', () => {
   state = reduce(state, { kind: 'timer' })
   assert.equal(state.phase, 'post')
 
-  state = reduce(state, { kind: 'network' })
+  state = legacyAsk(state)
   state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
   assert.equal(state.waitMs, RETRY_DELAYS[1])
 })
 
 test('probe com a sessao ocupada vira PENSANDO sem apagar o rascunho', () => {
-  let state = reduce(start(), { kind: 'network' })
+  let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe', state: 'busy', revision: ANCHOR })
   assert.equal(state.phase, 'thinking')
   assert.equal(state.clearDraft, false)
 })
 
 test('probe com revision diferente tambem vira PENSANDO sem apagar o rascunho', () => {
-  let state = reduce(start(), { kind: 'network' })
+  let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe', state: 'idle', revision: 'b'.repeat(16) })
   assert.equal(state.phase, 'thinking')
   assert.equal(state.clearDraft, false)
 })
 
 test('probe que falha nao queima um POST — cai na espera', () => {
-  let state = reduce(start(), { kind: 'network' })
+  let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe-failed' })
   assert.equal(state.phase, 'wait')
   assert.equal(state.attempts, 1)
 })
 
 test('a escada tem fim e para com o rascunho intacto', () => {
-  let state = start()
-  for (let post = 0; post < MAX_POSTS; post++) {
-    state = reduce(state, { kind: 'network' })
-    state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
-    if (state.phase === 'wait') state = reduce(state, { kind: 'timer' })
-  }
+  const state = exhaustLegacyLadder()
   assert.equal(state.phase, 'retry')
   assert.equal(state.reason, 'exhausted')
   assert.equal(state.clearDraft, false)
@@ -80,21 +154,16 @@ test('a escada tem fim e para com o rascunho intacto', () => {
 })
 
 test('o toque reabre a escada inteira e preserva o rascunho', () => {
-  let state = start()
-  for (let post = 0; post < MAX_POSTS; post++) {
-    state = reduce(state, { kind: 'network' })
-    state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
-    if (state.phase === 'wait') state = reduce(state, { kind: 'timer' })
-  }
-  const retried = reduce(state, { kind: 'manual' })
+  const retried = reduce(exhaustLegacyLadder(), { kind: 'manual' })
   assert.equal(retried.phase, 'post')
   assert.equal(retried.attempts, 0)
+  assert.equal(retried.asks, 0)
   assert.equal(retried.clearDraft, false)
   assert.equal(retried.anchorRevision, ANCHOR)
 })
 
 test('o toque encurta a espera em vez de esperar o degrau', () => {
-  let state = reduce(start(), { kind: 'network' })
+  let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
   assert.equal(state.phase, 'wait')
   assert.equal(reduce(state, { kind: 'manual' }).phase, 'post')
@@ -134,9 +203,9 @@ test('401 e 404 param com o rascunho guardado — retry automatico nao resolve',
   }
 })
 
-test('5xx e tratado como falha reciclavel e passa pelo probe', () => {
+test('5xx e tratado como falha reciclavel e vai perguntar pelo id', () => {
   const state = reduce(start(), { kind: 'http', status: 502 })
-  assert.equal(state.phase, 'probe')
+  assert.equal(state.phase, 'ask')
   assert.equal(state.reason, 'server')
 })
 

@@ -22,14 +22,21 @@ call, so a failed or hanging submit can no longer take the recording with it.
 - Submit failure keeps the draft and shows the reason. Tap resends (the server
   deduplicates by `clientMsgId` + audio fingerprint, so resending is a no-op if
   the turn already landed); scroll up discards.
-- Retries never blind-repeat the ~1.3 MB upload: a network failure first asks
-  `GET /session` whether the turn actually landed, and only re-posts when the
-  conversation is provably untouched. Automatic ladder: 5 s, 15 s, 40 s.
+- Retries never blind-repeat the ~1.3 MB upload. A network failure asks
+  `GET /turn/:clientMsgId` — a ~200 byte answer that is definitive: `done`
+  replays the outcome the POST would have returned, `pending` keeps asking
+  cheaply (2/4/8/15 s), and `unknown` is the only verdict that authorises
+  another upload (ladder: 5 s, 15 s, 40 s). If that route is missing — an older
+  backend — the client falls back to inferring from `GET /session`, so a
+  version skew degrades instead of failing.
 - Leaving the app mid-sentence drains the buffer into a draft instead of wiping
   it. The draft survives a restart for 15 minutes and is offered, never
   auto-sent.
-- `PENSANDO` shows elapsed time past 20 s and, after 4 minutes without an
-  answer, offers a refresh instead of waiting forever. Polling backs off from
+- `PENSANDO` shows elapsed time past 20 s. A turn the agent never closes is
+  reported by the server (`stuck` in `GET /session`, past 5 minutes) and a tap
+  calls `POST /interrupt` to release it — previously the only way out of a
+  permanent `busy` was restarting the container. The 4-minute local ceiling
+  still applies when the server does not report `stuck`. Polling backs off from
   1.2 s to 3 s to 8 s.
 - Only "no speech" (422), "audio too long" (413), and a rejected payload (400)
   discard the recording — nothing else does.
@@ -75,7 +82,11 @@ VITE_GLASS_API_TOKEN=dev-token npm run dev
 The mock injects failures so the loss paths are reproducible without hardware:
 `HERMES_MOCK_FAIL=hang|flaky|409|422|413|500` at startup, or
 `curl "http://127.0.0.1:8797/mock/fail?mode=hang"` at runtime. `hang` accepts
-the POST and never answers — the exact shape of the reported bug.
+the POST and never answers — the exact shape of the reported bug — while
+`flaky` drops the first upload before the server ever sees it. The two are
+deliberately different: the first must not be re-uploaded, the second must.
+`HERMES_MOCK_LEGACY=1` removes the turn-status route to exercise the
+version-skew fallback.
 
 The real glasses path still requires the Even Hub companion app and a phone on
 the same tailnet. Build/tests do not count as microphone, gesture, rendering,
