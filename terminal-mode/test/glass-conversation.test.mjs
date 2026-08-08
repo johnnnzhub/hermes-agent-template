@@ -418,3 +418,26 @@ test("provider status carries how long the active turn has been running", async 
   );
   await harness.provider.interrupt(harness.sessionId);
 });
+
+// O cliente precisa poder ler um 409 como "NAO entrou". Todo caminho de 409 do handler
+// retorna antes de `provider.prompt`, entao a sessao fica intocada — e por isso o plugin
+// nao pode inferir entrega a partir de uma revision que mudou junto com um conflito.
+test("a revision divergente rejeita o turno sem submeter nada", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const stale = await postTurn(harness, {
+    clientMsgId: "revisao-0001",
+    expectedRevision: "0".repeat(16),
+  });
+  assert.equal(stale.response.status, 409);
+  assert.match(stale.body.error, /conversa mudou/);
+  // Nem transcreveu, nem submeteu: nada da fala chegou ao agente.
+  assert.deepEqual(harness.transcripts, []);
+
+  const after = await getSession(harness);
+  assert.equal(after.body.revision, before.body.revision);
+  assert.equal(after.body.turns.length, before.body.turns.length);
+  assert.equal(after.body.state, "idle");
+});

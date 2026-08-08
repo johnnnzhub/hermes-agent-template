@@ -228,17 +228,27 @@ export async function fetchTurnStatus(clientMsgId: string): Promise<TurnStatus> 
   }
 }
 
-/** Solta um turno que o agente nao fecha sozinho. False quando a rota nao existe. */
-export async function interruptHermes(): Promise<boolean> {
+/**
+ * Solta um turno que o agente nao fecha sozinho.
+ *
+ * Distingue "esta rota nao existe aqui" de "existe e falhou" — colapsar as duas num
+ * booleano fazia um 401, um 502 ou um timeout serem anunciados como backend
+ * desatualizado, que e a mesma troca de diagnostico que custou quase uma hora em
+ * 2026-08-03.
+ */
+export type InterruptResult = 'ok' | 'missing' | 'failed'
+
+export async function interruptHermes(): Promise<InterruptResult> {
   try {
     const response = await fetchWithTimeout(
       `${baseUrl()}/glass/hermes/interrupt`,
       { method: 'POST', headers: authHeaders() },
       SESSION_TIMEOUT_MS,
     )
-    return response.ok
+    if (response.ok) return 'ok'
+    return response.status === 404 ? 'missing' : 'failed'
   } catch {
-    return false
+    return 'failed'
   }
 }
 

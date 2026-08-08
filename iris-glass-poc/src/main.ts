@@ -12,6 +12,7 @@ import {
   interruptHermes,
   newMsgId,
   sendVoiceTurn,
+  type InterruptResult,
   type HermesProgress,
   type HermesSession,
   type HermesTurn,
@@ -211,15 +212,11 @@ function sendingContent(): string {
 
 function retryContent(): string {
   if (!sendState || !pending) return emptyContent()
-  // Quando a conversa ja mudou por conta deste turno, descartar vem primeiro: reenviar
-  // seria mandar a mesma fala duas vezes.
-  const gestures = sendState.reason === 'maybe-sent'
-    ? ['ROLAR PRA CIMA = DESCARTAR', 'TOQUE = REENVIAR MESMO ASSIM']
-    : ['TOQUE = REENVIAR', 'ROLAR PRA CIMA = DESCARTAR']
   return [
     reasonHeadline(sendState.reason),
     ...wrapHudText(`» ${draftSummary(pending)}`).slice(0, 3),
-    ...gestures,
+    'TOQUE = REENVIAR',
+    'ROLAR PRA CIMA = DESCARTAR',
   ].join('\n')
 }
 
@@ -285,22 +282,12 @@ function showError(message: string) {
  * direto em vez de inferir.)
  */
 function reconcilePending(snapshot: HermesSession) {
-  if (!pending || !sendState) return
-
-  // Conflito cuja pos-condicao ja diz que o turno entrou. Reenviar aqui significaria
-  // mintar um clientMsgId novo — contornando o dedupe do servidor — e submeter o mesmo
-  // audio outra vez. O rascunho fica, mas o HUD para de chamar reenvio de caminho obvio.
-  if (sendState.phase === 'retry' && sendState.reason === 'conflict') {
-    const verdict = settlePending(pending, {
-      state: snapshot.state,
-      revision: snapshot.revision,
-      turnCount: snapshot.turns.length,
-    })
-    if (verdict === 'delivered') sendState = { ...sendState, reason: 'maybe-sent' }
-    return
-  }
-
-  if (sendState.phase !== 'thinking') return
+  if (!pending || sendState?.phase !== 'thinking') return
+  // A pos-condicao por revision vale AQUI e so aqui, onde o desfecho e desconhecido.
+  // Aplica-la a um 409 seria inverter a leitura: o servidor devolve 409 antes de chamar
+  // provider.prompt, entao um 409 prova que o audio NAO entrou — e a revision nova quase
+  // sempre veio de outro turno. Rotular isso de "ja enviou" empurra o descarte de uma
+  // fala que nunca foi entregue.
   const verdict = settlePending(pending, {
     state: snapshot.state,
     revision: snapshot.revision,
@@ -631,21 +618,25 @@ async function unstick() {
   if (unsticking || hudDead) return
   unsticking = true
   setStatus('connecting', 'Interrompendo')
-  let released = false
+  let outcome: InterruptResult = 'failed'
   try {
-    released = await interruptHermes()
+    outcome = await interruptHermes()
   } finally {
     unsticking = false
   }
   // Zerar o contador sem ter interrompido nada so esconderia o problema por mais quatro
-  // minutos. Contra um servidor sem a rota, o honesto e dizer que nao da para destravar.
-  if (released) {
+  // minutos.
+  if (outcome === 'ok') {
     remoteStuck = false
     busySince = 0
   }
   await refreshSession(true)
-  if (!released && remoteState !== 'idle') {
-    showError('Não consigo destravar: servidor sem essa rota.')
+  if (outcome !== 'ok' && remoteState !== 'idle') {
+    showError(
+      outcome === 'missing'
+        ? 'Não consigo destravar: servidor sem essa rota.'
+        : 'Não consegui interromper. Tente de novo.',
+    )
   }
 }
 

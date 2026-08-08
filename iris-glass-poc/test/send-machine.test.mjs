@@ -271,7 +271,6 @@ test('cada motivo tem uma manchete propria no HUD', () => {
   const reasons = [
     'none',
     'saved',
-    'maybe-sent',
     'network',
     'auth',
     'conflict',

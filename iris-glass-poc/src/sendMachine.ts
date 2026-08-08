@@ -33,8 +33,6 @@ export type SendReason =
   | 'none'
   /** Capturado e guardado, ainda sem nenhuma tentativa de envio. */
   | 'saved'
-  /** Conflito cuja pos-condicao indica que o turno JA entrou; reenviar duplicaria. */
-  | 'maybe-sent'
   | 'network'
   | 'auth'
   | 'conflict'
@@ -269,8 +267,6 @@ export function reasonHeadline(reason: SendReason): string {
   switch (reason) {
     case 'saved':
       return 'RASCUNHO GUARDADO'
-    case 'maybe-sent':
-      return 'PARECE QUE JÁ ENVIOU'
     case 'auth':
       return 'TOKEN DO HERMES INVÁLIDO'
     case 'conflict':
