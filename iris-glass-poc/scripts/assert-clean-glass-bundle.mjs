@@ -62,6 +62,22 @@ const files = [
     .map(file => join(assetsDir, file)),
 ]
 
+// A credencial precisa ter chegado ao bundle. Sem esta checagem o `pack` sai VERDE com o
+// token vazio e a falha so aparece como 401 no device — foi o que aconteceu em
+// 2026-06-10, quando um checkout novo nasceu sem `.env.local`. O valor nunca e impresso.
+function bakedToken() {
+  const fromEnv = process.env.VITE_GLASS_API_TOKEN
+  if (fromEnv) return fromEnv
+  try {
+    const line = readFileSync(join(root, '.env.local'), 'utf8')
+      .split('\n')
+      .find(entry => entry.startsWith('VITE_GLASS_API_TOKEN='))
+    return line ? line.slice('VITE_GLASS_API_TOKEN='.length).trim() : ''
+  } catch {
+    return ''
+  }
+}
+
 let failed = false
 let bundle = ''
 for (const file of files) {
@@ -81,5 +97,17 @@ for (const value of REQUIRED) {
   }
 }
 
+const token = bakedToken()
+if (!token) {
+  console.error('CREDENCIAL: VITE_GLASS_API_TOKEN ausente — o .ehpk daria 401 no device.')
+  console.error('Recupere o token (mesmo valor de GLASS_TOKEN no servidor) para .env.local.')
+  failed = true
+} else if (!bundle.includes(token)) {
+  console.error('CREDENCIAL: o token existe em .env.local mas NAO chegou ao dist.')
+  failed = true
+}
+
 if (failed) process.exit(1)
-console.log(`Bundle Hermes limpo: ${FORBIDDEN.length} proibições e ${REQUIRED.length} contratos verificados.`)
+console.log(
+  `Bundle Hermes limpo: ${FORBIDDEN.length} proibições, ${REQUIRED.length} contratos e a credencial verificados.`,
+)
