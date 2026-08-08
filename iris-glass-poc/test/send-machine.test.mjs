@@ -131,6 +131,52 @@ test('pergunta que falha insiste, e so cai no palpite depois de esgotar', () => 
   assert.equal(state.attempts, 1)
 })
 
+// Com a rota respondendo, a inferencia por revision NUNCA entra: um desfecho definitivo
+// existe e vai aparecer. Parar com o rascunho guardado e melhor que adivinhar.
+test('servidor que ja respondeu nunca degrada para inferencia', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-pending' })
+  assert.equal(state.trusted, true)
+  state = reduce(state, { kind: 'timer' })
+
+  for (let failure = 0; failure <= MAX_ASKS; failure++) {
+    state = reduce(state, { kind: 'status-failed' })
+    if (state.phase === 'wait') state = reduce(state, { kind: 'timer' })
+  }
+  assert.notEqual(state.phase, 'probe')
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.clearDraft, false)
+})
+
+// Contadores compartilhados faziam uma resposta de um tipo consumir a escada do outro.
+test('as escadas de pergunta pendente e de pergunta falha sao independentes', () => {
+  let state = reduce(start(), { kind: 'network' })
+  for (let round = 0; round < MAX_ASKS; round++) {
+    state = reduce(state, { kind: 'status-pending' })
+    assert.equal(state.phase, 'wait', 'pending nao deveria ter esgotado ainda')
+    state = reduce(state, { kind: 'timer' })
+  }
+  // Quatro "pending" nao podem ter gasto a escada de falhas.
+  state = reduce(state, { kind: 'status-failed' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitMs, ASK_DELAYS[0])
+  assert.equal(state.askFailures, 1)
+  assert.equal(state.asks, MAX_ASKS)
+})
+
+test('um POST novo comeca uma rodada limpa de perguntas', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-pending' })
+  state = reduce(state, { kind: 'timer' })
+  state = reduce(state, { kind: 'status-unknown' })
+  assert.equal(state.waitNext, 'post')
+
+  const posting = reduce(state, { kind: 'timer' })
+  assert.equal(posting.phase, 'post')
+  assert.equal(posting.asks, 0)
+  assert.equal(posting.askFailures, 0)
+})
+
 test('a primeira falha da pergunta nao vira inferencia', () => {
   let state = reduce(start(), { kind: 'network' })
   state = reduce(state, { kind: 'status-failed' })

@@ -47,6 +47,15 @@ export interface SendState {
   attempts: number
   /** Perguntas por id ja feitas enquanto o servidor respondia "pending". */
   asks: number
+  /** Perguntas que nao chegaram a ser respondidas. Contador SEPARADO de `asks`:
+   *  compartilhar um so fazia uma alternancia pending/failed pular a escada de ambos. */
+  askFailures: number
+  /**
+   * O servidor ja respondeu a rota por id alguma vez. A partir daqui a entrega tem
+   * resposta definitiva disponivel, entao inferir pela sessao — o unico caminho capaz de
+   * apagar uma fala nao entregue — deixa de ser aceitavel.
+   */
+  trusted: boolean
   waitMs: number
   /** Para onde o `wait` volta quando o tempo passa. */
   waitNext: 'post' | 'ask'
@@ -91,6 +100,8 @@ const BASE: SendState = {
   phase: 'post',
   attempts: 0,
   asks: 0,
+  askFailures: 0,
+  trusted: false,
   waitMs: 0,
   waitNext: 'post',
   reason: 'none',
@@ -149,14 +160,20 @@ function afterInconclusiveProbe(state: SendState): SendState {
  * revision, que e o unico caminho do cliente capaz de apagar uma fala nao entregue.
  */
 function afterFailedAsk(state: SendState): SendState {
-  const asks = state.asks + 1
-  if (asks > MAX_ASKS) return { ...state, phase: 'probe', waitMs: 0, asks }
+  const askFailures = state.askFailures + 1
+  if (askFailures > MAX_ASKS) {
+    // A rota ja respondeu antes: o desfecho existe e vai aparecer. Parar com o rascunho
+    // guardado e honesto; inferir pela sessao seria trocar uma resposta definitiva
+    // ausente por um palpite capaz de apagar a fala.
+    if (state.trusted) return park(state, 'exhausted')
+    return { ...state, phase: 'probe', waitMs: 0, askFailures }
+  }
   return {
     ...state,
     phase: 'wait',
-    waitMs: ASK_DELAYS[Math.min(asks - 1, ASK_DELAYS.length - 1)],
+    waitMs: ASK_DELAYS[Math.min(askFailures - 1, ASK_DELAYS.length - 1)],
     waitNext: 'ask',
-    asks,
+    askFailures,
   }
 }
 
@@ -225,11 +242,14 @@ export function reduce(state: SendState, event: SendEvent): SendState {
     case 'ask': {
       // Resposta definitiva do servidor sobre ESTE id — nao inferencia sobre a sessao.
       if (event.kind === 'status-done') {
-        if (event.turnStatus === 202) return accept(state, event.transcript)
-        return fromHttp(state, event.turnStatus)
+        const answered = { ...state, trusted: true }
+        if (event.turnStatus === 202) return accept(answered, event.transcript)
+        return fromHttp(answered, event.turnStatus)
       }
-      if (event.kind === 'status-pending') return afterPendingAsk(state)
-      if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
+      if (event.kind === 'status-pending') return afterPendingAsk({ ...state, trusted: true })
+      if (event.kind === 'status-unknown') {
+        return afterInconclusiveProbe({ ...state, trusted: true })
+      }
       // Rota ausente (servidor anterior a esta versao): o caminho antigo, que infere pela
       // revision da sessao, e tudo o que resta.
       if (event.kind === 'status-missing') return { ...state, phase: 'probe', waitMs: 0 }
@@ -251,8 +271,13 @@ export function reduce(state: SendState, event: SendEvent): SendState {
     }
 
     case 'wait': {
-      if (event.kind === 'timer') return { ...state, phase: state.waitNext, waitMs: 0 }
-      return state
+      if (event.kind !== 'timer') return state
+      // Um POST novo comeca uma rodada nova de perguntas: sem zerar, os contadores
+      // vazavam de uma tentativa para a seguinte e a proxima resposta era terminal na hora.
+      if (state.waitNext === 'post') {
+        return { ...state, phase: 'post', waitMs: 0, asks: 0, askFailures: 0 }
+      }
+      return { ...state, phase: 'ask', waitMs: 0 }
     }
 
     default:

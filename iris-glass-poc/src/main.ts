@@ -168,6 +168,7 @@ let sendState: SendState | null = null
 let sendGen = 0
 let waitTimer: number | null = null
 let delivering = false
+let resolving = false
 let lastProbe: HermesSession | null = null
 // Inicio do periodo ocupado, para o contador e para o teto do PENSANDO.
 let busySince = 0
@@ -283,6 +284,15 @@ function showError(message: string) {
  */
 function reconcilePending(snapshot: HermesSession) {
   if (!pending || sendState?.phase !== 'thinking') return
+
+  // A rota por id ja respondeu nesta entrega: o desfecho e obtivel, entao pergunta em vez
+  // de inferir. Inferir aqui creditaria a este audio qualquer mudanca de revision feita
+  // por OUTRO turno — e apagaria uma fala que o servidor talvez tenha rejeitado.
+  if (sendState.trusted) {
+    if (snapshot.state === 'idle') void resolvePendingById()
+    return
+  }
+
   // A pos-condicao por revision vale AQUI e so aqui, onde o desfecho e desconhecido.
   // Aplica-la a um 409 seria inverter a leitura: o servidor devolve 409 antes de chamar
   // provider.prompt, entao um 409 prova que o audio NAO entrou — e a revision nova quase
@@ -554,6 +564,27 @@ function applySendOutcome() {
     // Conflito exige revision fresca antes do proximo toque.
     if (state.needsRefresh) void refreshSession(true)
   }
+}
+
+/**
+ * Fecha uma entrega parada em PENSANDO perguntando pelo id, nunca adivinhando. Reusa a
+ * propria maquina para que 202, 409, 422 e "nunca vi" sigam tendo o mesmo tratamento.
+ */
+async function resolvePendingById() {
+  if (!pending || !sendState || resolving || delivering || hudDead) return
+  resolving = true
+  const gen = sendGen
+  try {
+    const event = await askTurn(pending)
+    if (gen !== sendGen || !pending || !sendState) return
+    // Ainda sem desfecho: a proxima volta para idle tenta de novo.
+    if (event.kind === 'status-pending' || event.kind === 'status-failed') return
+    if (event.kind === 'status-missing') return
+    sendState = reduce({ ...sendState, phase: 'ask' }, event)
+  } finally {
+    resolving = false
+  }
+  applySendOutcome()
 }
 
 async function deliverPending() {
