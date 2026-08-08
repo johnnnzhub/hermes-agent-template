@@ -4,6 +4,7 @@ import {
   AUDIO_SR,
   bytesToB64,
   cleanupMic,
+  discardCapture,
   drainRecording,
   hasCapturedAudio,
   isAudible,
@@ -15,12 +16,13 @@ import {
   toBytes,
 } from '../src/voice.ts'
 
-function fakeBridge() {
+function fakeBridge({ delayMs = 0 } = {}) {
   const calls = []
   return {
     calls,
     async audioControl(enabled) {
       calls.push(enabled)
+      if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs))
       return true
     },
   }
@@ -103,3 +105,52 @@ test('stopRecording desliga o microfone uma vez so', async () => {
   assert.deepEqual(bridge.calls, [true, false])
 })
 
+
+// Os dois caminhos que o Codex achou em 2026-08-08: fechar o microfone NAO pode destruir
+// a fala. Antes, cleanupMic zerava o buffer, entao double_click, ABNORMAL_EXIT e
+// beforeunload apagavam a gravacao em curso sem deixar rastro.
+test('fechar o microfone preserva a fala para quem for drenar depois', async () => {
+  const bridge = fakeBridge()
+  await startRecording(bridge)
+  onAudioChunk(tone(1_000))
+
+  await cleanupMic(bridge)
+  assert.deepEqual(bridge.calls, [true, false])
+  assert.equal(hasCapturedAudio(), true)
+
+  const drained = drainRecording()
+  assert.equal(drained.durMs, 1_000)
+  assert.equal(isAudible(drained.pcm, drained.durMs), true)
+})
+
+// stopRecording zera `recording` ANTES de esperar ate 2 s pelo hardware. Uma saida de
+// foreground nessa janela via "nao esta gravando" e o cleanup levava o PCM junto.
+test('a fala sobrevive a uma saida na janela entre parar e drenar', async () => {
+  // O hardware demora a confirmar: e dentro desta espera que a saida chegava.
+  const bridge = fakeBridge({ delayMs: 50 })
+  await startRecording(bridge)
+  onAudioChunk(tone(1_000))
+
+  const stopping = stopRecording(bridge, false)
+  // Quem sai nao consulta isRecording() — que ja e false aqui —, consulta se ha audio.
+  assert.equal(isRecording(), false)
+  assert.equal(hasCapturedAudio(), true)
+
+  // Ordem do app: guardar a fala e sincrono e vem ANTES de fechar o microfone.
+  const rescued = drainRecording()
+  assert.equal(rescued.durMs, 1_000)
+  assert.equal(isAudible(rescued.pcm, rescued.durMs), true)
+  await cleanupMic(bridge)
+
+  // stopRecording termina de mãos vazias, e isso e esperado: a fala ja foi salva.
+  const late = await stopping
+  assert.equal(late.pcm, null)
+})
+
+test('o descarte explicito continua limpando o buffer', async () => {
+  await startRecording(null)
+  onAudioChunk(tone(1_000))
+  discardCapture()
+  assert.equal(hasCapturedAudio(), false)
+  assert.equal(isRecording(), false)
+})

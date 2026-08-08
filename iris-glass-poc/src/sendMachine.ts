@@ -33,6 +33,8 @@ export type SendReason =
   | 'none'
   /** Capturado e guardado, ainda sem nenhuma tentativa de envio. */
   | 'saved'
+  /** Conflito cuja pos-condicao indica que o turno JA entrou; reenviar duplicaria. */
+  | 'maybe-sent'
   | 'network'
   | 'auth'
   | 'conflict'
@@ -169,16 +171,24 @@ function fromHttp(state: SendState, status: number): SendState {
   // A conversa mudou. Reenviar exige um turno genuinamente novo: mexer na revision muda
   // o fingerprint e o servidor devolveria 409 "clientMsgId ja foi utilizado".
   if (status === 409) return park(state, 'conflict', true)
+  // Descartar so onde a gravacao comprovadamente nao serve: audio maior que o limite e
+  // audio sem fala. Qualquer outro status PARA com o rascunho guardado — antes, o default
+  // descartava, entao um 408, 425 ou 429 transitorio apagava uma fala que um reenvio
+  // teria entregue.
   if (status === 413) return discard(state, 'too-long')
   if (status === 422) return discard(state, 'no-speech')
-  // 400 e afins: o payload nao e aceitavel e repeti-lo identico nao muda nada.
-  return discard(state, 'server')
+  return park(state, 'server')
 }
 
 export function reduce(state: SendState, event: SendEvent): SendState {
   // O toque do usuario vale em qualquer estado parado e reabre a escada inteira.
   if (event.kind === 'manual') {
     if (state.phase !== 'retry' && state.phase !== 'wait') return state
+    // Esperando para PERGUNTAR de novo: o servidor ja confirmou que tem o turno, entao
+    // apressar nao pode virar reenvio dos ~1,28 MB.
+    if (state.phase === 'wait' && state.waitNext === 'ask') {
+      return { ...state, phase: 'ask', waitMs: 0 }
+    }
     return {
       ...BASE,
       transcript: state.transcript,
@@ -259,6 +269,8 @@ export function reasonHeadline(reason: SendReason): string {
   switch (reason) {
     case 'saved':
       return 'RASCUNHO GUARDADO'
+    case 'maybe-sent':
+      return 'PARECE QUE JÁ ENVIOU'
     case 'auth':
       return 'TOKEN DO HERMES INVÁLIDO'
     case 'conflict':

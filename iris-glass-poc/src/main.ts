@@ -27,7 +27,9 @@ import {
   AUDIO_SR,
   bytesToB64,
   cleanupMic,
+  discardCapture,
   drainRecording,
+  hasCapturedAudio,
   isAudible,
   isRecording,
   onAudioChunk,
@@ -209,11 +211,15 @@ function sendingContent(): string {
 
 function retryContent(): string {
   if (!sendState || !pending) return emptyContent()
+  // Quando a conversa ja mudou por conta deste turno, descartar vem primeiro: reenviar
+  // seria mandar a mesma fala duas vezes.
+  const gestures = sendState.reason === 'maybe-sent'
+    ? ['ROLAR PRA CIMA = DESCARTAR', 'TOQUE = REENVIAR MESMO ASSIM']
+    : ['TOQUE = REENVIAR', 'ROLAR PRA CIMA = DESCARTAR']
   return [
     reasonHeadline(sendState.reason),
     ...wrapHudText(`» ${draftSummary(pending)}`).slice(0, 3),
-    'TOQUE = REENVIAR',
-    'ROLAR PRA CIMA = DESCARTAR',
+    ...gestures,
   ].join('\n')
 }
 
@@ -279,7 +285,22 @@ function showError(message: string) {
  * direto em vez de inferir.)
  */
 function reconcilePending(snapshot: HermesSession) {
-  if (!pending || sendState?.phase !== 'thinking') return
+  if (!pending || !sendState) return
+
+  // Conflito cuja pos-condicao ja diz que o turno entrou. Reenviar aqui significaria
+  // mintar um clientMsgId novo — contornando o dedupe do servidor — e submeter o mesmo
+  // audio outra vez. O rascunho fica, mas o HUD para de chamar reenvio de caminho obvio.
+  if (sendState.phase === 'retry' && sendState.reason === 'conflict') {
+    const verdict = settlePending(pending, {
+      state: snapshot.state,
+      revision: snapshot.revision,
+      turnCount: snapshot.turns.length,
+    })
+    if (verdict === 'delivered') sendState = { ...sendState, reason: 'maybe-sent' }
+    return
+  }
+
+  if (sendState.phase !== 'thinking') return
   const verdict = settlePending(pending, {
     state: snapshot.state,
     revision: snapshot.revision,
@@ -464,6 +485,22 @@ async function postTurn(turn: PendingTurn): Promise<SendEvent> {
   }
 }
 
+/**
+ * Idempotente: tira do buffer o que ja foi falado e transforma em rascunho. Todo caminho
+ * de saida passa por aqui ANTES de fechar o microfone. Devolve true quando guardou algo.
+ *
+ * Nao depende de `isRecording()`: stopRecording zera esse sinal antes de esperar ate 2 s
+ * pelo hardware, e uma saida nessa janela via "nao estava gravando" e perdia a fala.
+ */
+function captureDraft(): boolean {
+  if (pending || !hasCapturedAudio()) return false
+  const { pcm, durMs } = drainRecording()
+  if (!isAudible(pcm, durMs)) return false
+  pending = adoptDraft(pcm, durMs)
+  sendState = parkedDraft(pending.expectedRevision)
+  return true
+}
+
 async function askTurn(turn: PendingTurn): Promise<SendEvent> {
   const status = await fetchTurnStatus(turn.clientMsgId)
   if (status.kind === 'done') {
@@ -594,21 +631,28 @@ async function unstick() {
   if (unsticking || hudDead) return
   unsticking = true
   setStatus('connecting', 'Interrompendo')
+  let released = false
   try {
-    // Falso quando a rota nao existe no servidor: o refresh a seguir ainda vale como
-    // tentativa honesta de reler o estado real.
-    await interruptHermes()
+    released = await interruptHermes()
   } finally {
     unsticking = false
   }
-  remoteStuck = false
-  busySince = 0
+  // Zerar o contador sem ter interrompido nada so esconderia o problema por mais quatro
+  // minutos. Contra um servidor sem a rota, o honesto e dizer que nao da para destravar.
+  if (released) {
+    remoteStuck = false
+    busySince = 0
+  }
   await refreshSession(true)
+  if (!released && remoteState !== 'idle') {
+    showError('Não consigo destravar: servidor sem essa rota.')
+  }
 }
 
 function discardDraft() {
   if (!pending) return
   dropDraft()
+  discardCapture()
   echo = ''
   notice = ''
   mode = 'history'
@@ -638,8 +682,10 @@ async function finishRecording() {
   try {
     const { pcm, durMs } = await stopRecording(bridge, false)
     if (!pcm) {
+      // Uma saida de foreground durante o `await` acima pode ter guardado a fala antes:
+      // nesse caso o buffer chega vazio aqui sem que nada tenha se perdido.
       mode = restingMode()
-      showError('Não ouvi fala suficiente.')
+      if (!pending) showError('Não ouvi fala suficiente.')
     } else {
       // PRE-CONDICAO do envio: a fala vira artefato duravel antes da primeira chamada de
       // rede. Ate a v0.4.3 o PCM so existia neste escopo — qualquer falha o levava junto,
@@ -682,6 +728,10 @@ async function cleanup() {
     window.clearTimeout(renderTimer)
     renderTimer = null
   }
+  // Sair do app nao pode custar a fala. double_click, ABNORMAL_EXIT, SYSTEM_EXIT e
+  // beforeunload chegam aqui — e ate a v0.6.0 os quatro destruiam a gravacao em curso.
+  // A escrita do rascunho e sincrona, entao sobrevive ate ao beforeunload.
+  captureDraft()
   await cleanupMic(bridge)
   unsubscribe()
 }
@@ -760,16 +810,11 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       if (isForegroundExit(event)) {
         clearRecordingTimer()
         // Ate a v0.4.3 este caminho chamava cleanupMic direto, que zerava o buffer: sair
-        // do app no meio de uma frase destruia a fala em silencio. Agora drena primeiro.
-        const captured = isRecording() ? drainRecording() : null
+        // do app no meio de uma frase destruia a fala em silencio. Agora guarda primeiro.
+        const saved = captureDraft()
         void cleanupMic(bridge).then(() => {
-          if (captured && isAudible(captured.pcm, captured.durMs) && !pending) {
-            pending = adoptDraft(captured.pcm, captured.durMs)
-            sendState = parkedDraft(pending.expectedRevision)
-            mode = 'retry'
-          } else if (mode === 'recording') {
-            mode = restingMode()
-          }
+          if (saved) mode = 'retry'
+          else if (mode === 'recording') mode = restingMode()
           renderState()
         })
       }

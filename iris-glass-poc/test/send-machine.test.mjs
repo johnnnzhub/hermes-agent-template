@@ -162,6 +162,19 @@ test('o toque reabre a escada inteira e preserva o rascunho', () => {
   assert.equal(retried.anchorRevision, ANCHOR)
 })
 
+// Apressar nao pode virar reenvio: o servidor ja confirmou que tem o turno.
+test('o toque durante a espera de PERGUNTA volta a perguntar, nao a subir o audio', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-pending' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'ask')
+
+  const tapped = reduce(state, { kind: 'manual' })
+  assert.equal(tapped.phase, 'ask')
+  assert.equal(tapped.attempts, 1)
+  assert.equal(tapped.asks, state.asks)
+})
+
 test('o toque encurta a espera em vez de esperar o degrau', () => {
   let state = legacyAsk(start())
   state = reduce(state, { kind: 'probe', state: 'idle', revision: ANCHOR })
@@ -209,10 +222,18 @@ test('5xx e tratado como falha reciclavel e vai perguntar pelo id', () => {
   assert.equal(state.reason, 'server')
 })
 
-test('400 descarta: payload recusado nao melhora com repeticao', () => {
-  const state = reduce(start(), { kind: 'http', status: 400 })
-  assert.equal(state.phase, 'discarded')
-  assert.equal(state.clearDraft, true)
+// Descartar e privilegio de quem PROVA que a gravacao nao serve. O default antigo
+// descartava qualquer status nao listado, entao um 408/425/429 transitorio — os que um
+// reenvio resolveria — apagava a fala.
+test('so 413 e 422 descartam; todo o resto para com o rascunho guardado', () => {
+  for (const status of [400, 402, 405, 408, 418, 425, 429, 451]) {
+    const state = reduce(start(), { kind: 'http', status })
+    assert.equal(state.phase, 'retry', `status ${status} deveria parar, nao descartar`)
+    assert.equal(state.clearDraft, false, `status ${status} apagou o rascunho`)
+  }
+  for (const status of [413, 422]) {
+    assert.equal(reduce(start(), { kind: 'http', status }).phase, 'discarded')
+  }
 })
 
 test('estados terminais ignoram eventos atrasados', () => {
@@ -250,6 +271,7 @@ test('cada motivo tem uma manchete propria no HUD', () => {
   const reasons = [
     'none',
     'saved',
+    'maybe-sent',
     'network',
     'auth',
     'conflict',

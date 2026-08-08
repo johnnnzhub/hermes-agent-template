@@ -122,12 +122,24 @@ export async function stopRecording(
   return { pcm, durMs }
 }
 
+/**
+ * Fecha o microfone. NAO descarta a fala capturada — quem tira do buffer e
+ * drainRecording, e so ele. Enquanto isto zerava o buffer, todo caminho de saida
+ * (double_click, ABNORMAL_EXIT, beforeunload, e a janela de ate 2 s em que stopRecording
+ * espera o hardware) destruia a gravacao em silencio. O buffer sobrevive ate o proximo
+ * startRecording, que sempre comeca limpo.
+ */
 export async function cleanupMic(bridge: Bridge | null): Promise<void> {
   recording = false
-  pcmChunks = []
-  pcmLen = 0
   if (!micOpen) return
   micOpen = false
   if (bridge) await audioControl(bridge, false, true)
+}
+
+/** Descarte explicito do buffer, para quando a fala realmente nao serve mais. */
+export function discardCapture(): void {
+  recording = false
+  pcmChunks = []
+  pcmLen = 0
 }
 
