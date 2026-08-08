@@ -195,6 +195,10 @@ export class HermesProvider {
     return {
       state: this.#state(),
       provider: WIRE_PROVIDER,
+      // Nada limita a duracao de um turno: turnActive so cai com result, error ou crash.
+      // Sem expor ha quanto tempo ele dura, o cliente nao consegue distinguir "pensando"
+      // de "travado" e fica em PENSANDO para sempre.
+      turnDurationMs: this.#turnDurationMs(),
     };
   }
 

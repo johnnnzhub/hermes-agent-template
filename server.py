@@ -1598,6 +1598,62 @@ async def route_api_v1(request: Request) -> Response:
     )
 
 
+async def route_api_job_run(request: Request) -> Response:
+    """Public POST proxy for the native api_server job runner.
+
+    No cookie guard: the upstream API_SERVER_KEY Bearer check is the gate. The
+    request body and Authorization header are forwarded unchanged; unlike the
+    G2 /v1 proxy, this route never injects a presentation prompt.
+    """
+    if not os.environ.get("API_SERVER_KEY"):
+        return JSONResponse(
+            {"error": "API server disabled — API_SERVER_KEY not configured"},
+            status_code=503,
+        )
+
+    target = f"{API_SERVER_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
+    body = await request.body()
+    client = get_http_client()
+    timeout = httpx.Timeout(300.0, connect=5.0)
+
+    try:
+        upstream_req = client.build_request(
+            request.method, target, headers=req_headers, content=body, timeout=timeout
+        )
+        upstream = await client.send(upstream_req, stream=True)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return JSONResponse(
+            {"error": "api_server unavailable — gateway starting or stopped"},
+            status_code=503,
+        )
+    except httpx.RequestError as e:
+        print(f"[jobs-proxy] upstream error for {request.url.path}: {e}", flush=True)
+        return JSONResponse({"error": "upstream error"}, status_code=502)
+
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+    }
+
+    async def _stream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
 # ── Hermes Glass API — plugin Iris Glass nos óculos G2 (fase 0.2.x) ──────────
 # Adaptador fino read-only: /glass/tasks consulta o gateway n8n g2-fluxo
 # (?action=tasks — mesma fonte battle-tested do plugin HQ) e devolve linhas
@@ -1792,7 +1848,24 @@ async def route_setup_404(request: Request) -> Response:
 
 
 # ── App lifecycle ─────────────────────────────────────────────────────────────
+GATEWAY_AUTOSTART_APPROVAL_ENV = "IRIS_GATEWAY_AUTOSTART_APPROVED"
+GATEWAY_AUTOSTART_APPROVED_VALUES = frozenset({"1", "true", "yes", "on", "approved"})
+
+
+def gateway_autostart_approved() -> bool:
+    """Fail closed: only an explicit allowlisted value may start the gateway."""
+    value = os.environ.get(GATEWAY_AUTOSTART_APPROVAL_ENV, "")
+    return value.strip().lower() in GATEWAY_AUTOSTART_APPROVED_VALUES
+
+
 async def auto_start():
+    if not gateway_autostart_approved():
+        print(
+            f"[server] Gateway auto-start blocked — set {GATEWAY_AUTOSTART_APPROVAL_ENV} "
+            "to an approved value to enable it.",
+            flush=True,
+        )
+        return
     if is_config_complete():
         print("[server] Config complete — auto-starting gateway.", flush=True)
         asyncio.create_task(gw.start())
@@ -2018,6 +2091,10 @@ routes = [
     # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
     # WS endpoints in future hermes releases proxy without re-touching this list.
     WebSocketRoute("/api/plugins/{path:path}",  ws_proxy),
+
+    # Native job runner — PUBLIC at the edge; API_SERVER_KEY Bearer auth is
+    # enforced upstream. Exact method/path only, before the cookie catch-all.
+    Route("/api/jobs/{job_id}/run",            route_api_job_run,   methods=["POST"]),
 
     # OpenAI-compatible API for the Even G2 glasses — PUBLIC at the edge (bearer
     # auth is enforced upstream by the native api_server). Must precede the

@@ -1,0 +1,361 @@
+// Entrega ponta a ponta contra o mock, por socket de verdade.
+//
+// Os testes unitarios provam a maquina; este prova o que o John relatou: o servidor
+// pendura, o HUD fica em PENSANDO e a gravacao some. Aqui o "pendura" e real — o mock
+// aceita o POST e nunca responde — e o criterio e que o rascunho sobreviva.
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import {
+  ASK_DELAYS,
+  MAX_POSTS,
+  RETRY_DELAYS,
+  reduce,
+  startSend,
+} from '../src/sendMachine.ts'
+
+const MOCK = join(dirname(fileURLToPath(import.meta.url)), '..', 'mock-hermes-api.mjs')
+// Curto de proposito: o valor real (45 s) esta em glassApi.ts; aqui o que importa e o
+// comportamento depois do estouro, nao o numero.
+const TIMEOUT_MS = 300
+
+async function startMock(failMode, port, legacy = false) {
+  const child = spawn(process.execPath, [MOCK], {
+    env: {
+      ...process.env,
+      HERMES_API_PORT: String(port),
+      HERMES_MOCK_FAIL: failMode,
+      HERMES_MOCK_LEGACY: legacy ? '1' : '0',
+      GLASS_TOKEN: '',
+    },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  })
+  await once(child.stdout, 'data')
+  return child
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function readSession(port) {
+  const response = await fetchWithTimeout(`http://127.0.0.1:${port}/glass/hermes/session`, {}, 2_000)
+  return response.json()
+}
+
+async function postTurn(port, body) {
+  try {
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${port}/glass/hermes/turn`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+      TIMEOUT_MS,
+    )
+    if (!response.ok) return { kind: 'http', status: response.status }
+    const json = await response.json()
+    // 200 + staged = transcrito e retido; 202 = ja entregue (servidor antigo).
+    if (response.status === 200 && json.staged === true) {
+      return { kind: 'staged', transcript: json.transcript }
+    }
+    return { kind: 'accepted', transcript: json.transcript }
+  } catch {
+    return { kind: 'network' }
+  }
+}
+
+async function commit(port, clientMsgId, expectedRevision) {
+  try {
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${port}/glass/hermes/turn/${clientMsgId}/commit`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedRevision }),
+      },
+      TIMEOUT_MS,
+    )
+    if (!response.ok) return { kind: 'http', status: response.status }
+    const json = await response.json()
+    if (response.status === 202) return { kind: 'accepted', transcript: json.transcript }
+    return { kind: 'status-unknown' }
+  } catch {
+    return { kind: 'network' }
+  }
+}
+
+async function probe(port) {
+  try {
+    const snapshot = await readSession(port)
+    return { kind: 'probe', state: snapshot.state, revision: snapshot.revision }
+  } catch {
+    return { kind: 'probe-failed' }
+  }
+}
+
+async function ask(port, clientMsgId) {
+  try {
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${port}/glass/hermes/turn/${clientMsgId}`,
+      {},
+      2_000,
+    )
+    if (response.status === 404) return { kind: 'status-missing' }
+    if (!response.ok) return { kind: 'status-failed' }
+    const body = await response.json()
+    if (body.status === 'unknown') return { kind: 'status-unknown' }
+    if (body.status === 'pending') return { kind: 'status-pending' }
+    if (body.status === 'done') {
+      return {
+        kind: 'status-done',
+        turnStatus: body.turn.status,
+        transcript: body.turn.body?.transcript ?? '',
+      }
+    }
+    return { kind: 'status-failed' }
+  } catch {
+    return { kind: 'status-failed' }
+  }
+}
+
+/** Roda a entrega inteira sem dormir de verdade: o degrau da escada vira um `timer`. */
+async function deliver(port, draft, initial = null) {
+  let state = initial ?? startSend(draft.expectedRevision)
+  const waits = []
+  for (let guard = 0; guard < 32; guard++) {
+    if (state.phase === 'post') state = reduce(state, await postTurn(port, draft))
+    else if (state.phase === 'ask') state = reduce(state, await ask(port, draft.clientMsgId))
+    else if (state.phase === 'probe') state = reduce(state, await probe(port))
+    else if (state.phase === 'commit') {
+      state = reduce(state, await commit(port, draft.clientMsgId, draft.expectedRevision))
+    }
+    else if (state.phase === 'wait') {
+      waits.push(state.waitMs)
+      state = reduce(state, { kind: 'timer' })
+    } else break
+  }
+  return { state, waits }
+}
+
+async function scenario(failMode, port, run, legacy = false) {
+  const child = await startMock(failMode, port, legacy)
+  try {
+    return await run()
+  } finally {
+    child.kill()
+    await once(child, 'exit')
+  }
+}
+
+function draftFor(revision) {
+  return {
+    pcmB64: 'AAAAAAAA',
+    sampleRate: 16_000,
+    channels: 1,
+    bitDepth: 16,
+    clientMsgId: 'teste-integracao-1',
+    expectedRevision: revision,
+  }
+}
+
+test('caminho feliz: o 202 encerra a entrega e libera o rascunho', async () => {
+  const port = 8791
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const { state, waits } = await deliver(port, draftFor(before.revision))
+    assert.equal(state.phase, 'thinking')
+    assert.equal(state.clearDraft, true)
+    assert.equal(state.transcript, 'Mensagem de voz simulada')
+    assert.deepEqual(waits, [])
+    assert.equal(state.attempts, 1)
+  })
+})
+
+// O cenario exato do relato: o servidor aceita o POST e nunca responde.
+test('servidor que pendura nao reenvia o audio e mantem o rascunho', async () => {
+  const port = 8792
+  await scenario('hang', port, async () => {
+    const before = await readSession(port)
+    const { state, waits } = await deliver(port, draftFor(before.revision))
+
+    // O servidor confirma que TEM o turno, entao o cliente insiste barato e para de
+    // gastar upload: um POST so, contra os quatro da v0.4.3.
+    assert.equal(state.attempts, 1)
+    assert.deepEqual(waits, ASK_DELAYS)
+    assert.equal(state.phase, 'thinking')
+    // O ponto do bug: a fala continua recuperavel.
+    assert.equal(state.clearDraft, false)
+  })
+})
+
+// Version skew: cliente novo contra o backend que ainda nao tem a rota de status.
+test('sem a rota de status o cliente cai na escada antiga, ainda sem perder a fala', async () => {
+  const port = 8797
+  await scenario(
+    'hang',
+    port,
+    async () => {
+      const before = await readSession(port)
+      const { state, waits } = await deliver(port, draftFor(before.revision))
+
+      assert.equal(state.phase, 'retry')
+      assert.equal(state.reason, 'exhausted')
+      assert.equal(state.clearDraft, false)
+      assert.equal(state.attempts, MAX_POSTS)
+      assert.deepEqual(waits, RETRY_DELAYS)
+
+      // E a sessao no servidor nao mexeu — nada entrou, entao reenviar e legitimo.
+      const after = await readSession(port)
+      assert.equal(after.revision, before.revision)
+      assert.equal(after.turns.length, before.turns.length)
+    },
+    true,
+  )
+})
+
+test('o desfecho do turno fica recuperavel por id depois de entregue', async () => {
+  const port = 8798
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    assert.deepEqual(await ask(port, 'teste-integracao-1'), { kind: 'status-unknown' })
+
+    await deliver(port, draftFor(before.revision))
+
+    // Uma resposta de ~200 bytes conta o mesmo que o POST de ~1,28 MB teria contado.
+    const status = await ask(port, 'teste-integracao-1')
+    assert.equal(status.kind, 'status-done')
+    assert.equal(status.turnStatus, 202)
+    assert.equal(status.transcript, 'Mensagem de voz simulada')
+  })
+})
+
+// Upload que morre no caminho: o servidor nunca soube do turno, entao reenviar e o certo
+// — e e o unico caso em que o audio sobe de novo.
+test('upload perdido se resolve sozinho na segunda tentativa', async () => {
+  const port = 8793
+  await scenario('flaky', port, async () => {
+    const before = await readSession(port)
+    const { state, waits } = await deliver(port, draftFor(before.revision))
+
+    assert.equal(state.phase, 'thinking')
+    assert.equal(state.clearDraft, true)
+    assert.equal(state.attempts, 2)
+    assert.deepEqual(waits, [RETRY_DELAYS[0]])
+
+    const after = await readSession(port)
+    assert.notEqual(after.revision, before.revision)
+    assert.equal(after.turns.length, before.turns.length + 1)
+  })
+})
+
+test('revision velha para a entrega em vez de duplicar o turno', async () => {
+  const port = 8794
+  await scenario('none', port, async () => {
+    const { state } = await deliver(port, draftFor('f'.repeat(16)))
+    assert.equal(state.phase, 'retry')
+    assert.equal(state.reason, 'conflict')
+    assert.equal(state.needsRefresh, true)
+    assert.equal(state.clearDraft, false)
+  })
+})
+
+test('5xx passa pelo probe, percorre a escada e nao vira descarte', async () => {
+  const port = 8795
+  await scenario('503', port, async () => {
+    const before = await readSession(port)
+    const { state, waits } = await deliver(port, draftFor(before.revision))
+    // Erro do servidor e reciclavel: gasta a escada inteira antes de parar, e para com
+    // a fala guardada — nunca descarta.
+    assert.equal(state.phase, 'retry')
+    assert.equal(state.reason, 'exhausted')
+    assert.equal(state.clearDraft, false)
+    assert.deepEqual(waits, RETRY_DELAYS)
+  })
+})
+
+test('422 e o unico caminho que descarta a gravacao', async () => {
+  const port = 8796
+  await scenario('422', port, async () => {
+    const before = await readSession(port)
+    const { state } = await deliver(port, draftFor(before.revision))
+    assert.equal(state.phase, 'discarded')
+    assert.equal(state.reason, 'no-speech')
+    assert.equal(state.clearDraft, true)
+  })
+})
+
+// A prova que importa da confirmacao, contra o servidor de verdade por socket: entre a
+// transcricao e o toque, a conversa nao pode ter mudado. Se a revision ou a contagem de
+// turnos mexesse aqui, "confirmar antes de enviar" seria propaganda — a fala ja teria ido.
+test('confirmação: a fala só entra na conversa depois do toque', async () => {
+  const port = 8797
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+
+    const staged = await deliver(port, draft)
+    assert.equal(staged.state.phase, 'staged')
+    assert.equal(staged.state.transcript, 'Mensagem de voz simulada')
+    assert.equal(staged.state.clearDraft, false)
+
+    const during = await readSession(port)
+    assert.equal(during.revision, before.revision)
+    assert.equal(during.turns.length, before.turns.length)
+    assert.equal(during.state, 'idle')
+
+    const confirmed = await deliver(
+      port,
+      draft,
+      reduce(staged.state, { kind: 'manual' }),
+    )
+    assert.equal(confirmed.state.phase, 'thinking')
+    assert.equal(confirmed.state.clearDraft, true)
+
+    const after = await readSession(port)
+    assert.equal(after.turns.length, before.turns.length + 1)
+    assert.notEqual(after.revision, before.revision)
+  })
+})
+
+// Confirmar duas vezes (toque duplicado, retry apos rede instavel) nao pode render dois
+// turnos: o servidor guarda o desfecho por clientMsgId.
+test('confirmação repetida entrega um turno só', async () => {
+  const port = 8798
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+    const staged = await deliver(port, draft)
+    assert.equal(staged.state.phase, 'staged')
+
+    await deliver(port, draft, reduce(staged.state, { kind: 'manual' }))
+    const once = await readSession(port)
+    await deliver(port, draft, reduce(staged.state, { kind: 'manual' }))
+    const twice = await readSession(port)
+
+    assert.equal(once.turns.length, before.turns.length + 1)
+    assert.equal(twice.turns.length, once.turns.length)
+  })
+})
+
+// Backend antigo em producao ignora o pedido de confirmacao e ja entrega. O cliente nao
+// pode ficar parado esperando um toque que nao decide mais nada.
+test('contra o backend antigo a confirmação não trava a entrega', async () => {
+  const port = 8799
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+    const result = await deliver(port, draft)
+    assert.equal(result.state.phase, 'thinking')
+    assert.equal(result.state.clearDraft, true)
+    const after = await readSession(port)
+    assert.equal(after.turns.length, before.turns.length + 1)
+  }, true)
+})

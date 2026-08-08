@@ -14,6 +14,43 @@ second agent, model profile, memory, or conversation.
 - Close while busy: Hermes continues; reopening shows current progress or the
   completed answer.
 
+### Recorded speech is never dropped
+
+Since 0.5.0 the captured PCM becomes a durable draft *before* the first network
+call, so a failed or hanging submit can no longer take the recording with it.
+
+- Submit failure keeps the draft and shows the reason. Tap resends (the server
+  deduplicates by `clientMsgId` + audio fingerprint, so resending is a no-op if
+  the turn already landed); scroll up discards.
+- Nothing reaches the agent without a tap. The audio uploads, the server
+  transcribes and **stops** (`POST /turn` with `confirm`, answered `200
+  {staged:true, transcript}`); the HUD shows what was heard and only
+  `POST /turn/:clientMsgId/commit` — ~200 bytes, no re-upload — hands it over.
+  Confirming before the upload is impossible: the glasses cannot transcribe.
+  The revision is re-checked at commit time, not inherited from the upload, so
+  a conversation that moved on in the meantime is refused rather than injected
+  into. Against a backend without the route the `confirm` field is ignored and
+  the turn goes straight through, exactly as before.
+- Retries never blind-repeat the ~1.3 MB upload. A network failure asks
+  `GET /turn/:clientMsgId` — a ~200 byte answer that is definitive: `done`
+  replays the outcome the POST would have returned, `pending` keeps asking
+  cheaply (2/4/8/15 s), and `unknown` is the only verdict that authorises
+  another upload (ladder: 5 s, 15 s, 40 s). If that route is missing — an older
+  backend — the client falls back to inferring from `GET /session`, so a
+  version skew degrades instead of failing.
+- Leaving the app mid-sentence drains the buffer into a draft instead of wiping
+  it. The draft survives a restart for 15 minutes and is offered, never
+  auto-sent.
+- `PENSANDO` shows elapsed time past 20 s. A turn the agent never closes is
+  reported by the server (`stuck` in `GET /session`, past 5 minutes) and a tap
+  calls `POST /interrupt` to release it — previously the only way out of a
+  permanent `busy` was restarting the container. The 4-minute local ceiling
+  still applies when the server does not report `stuck`. Polling backs off from
+  1.2 s to 3 s to 8 s.
+- Only "no speech" (422) and "audio too long" (413) discard the recording.
+  Every other status — including 400 and any transient 408/425/429 — parks with
+  the draft intact, because a resend would have delivered it.
+
 The display exposes conversation text plus safe progress (`Pensando`,
 `Usando <ferramenta>`, or `Aguardando no Terminal Mode`). Tool arguments,
 outputs, logs, secrets, questions, and approval details are never returned by
@@ -52,6 +89,15 @@ VITE_HERMES_API_BASE=http://127.0.0.1:8797 \
 VITE_GLASS_API_TOKEN=dev-token npm run dev
 ```
 
+The mock injects failures so the loss paths are reproducible without hardware:
+`HERMES_MOCK_FAIL=hang|flaky|409|422|413|500` at startup, or
+`curl "http://127.0.0.1:8797/mock/fail?mode=hang"` at runtime. `hang` accepts
+the POST and never answers — the exact shape of the reported bug — while
+`flaky` drops the first upload before the server ever sees it. The two are
+deliberately different: the first must not be re-uploaded, the second must.
+`HERMES_MOCK_LEGACY=1` removes the turn-status route to exercise the
+version-skew fallback.
+
 The real glasses path still requires the Even Hub companion app and a phone on
 the same tailnet. Build/tests do not count as microphone, gesture, rendering,
 or reconnect validation on physical G2 hardware.
@@ -62,6 +108,9 @@ or reconnect validation on physical G2 hardware.
 |---|---|
 | `src/main.ts` | G2 lifecycle, gestures, serialized full-container renders, polling, and voice flow. |
 | `src/glassApi.ts` | Scoped authenticated API client with stable retry IDs and timeouts. |
+| `src/pendingTurn.ts` | Durable draft of the captured speech; versioned, TTL'd, quota-safe. |
+| `src/sendMachine.ts` | Pure delivery state machine: probe before re-upload, ladder, post-condition. |
+| `src/thinking.ts` | Poll backoff and the honest `PENSANDO` counter/ceiling. |
 | `src/conversation.ts` | Pure history wrapping, pagination, and merge logic. |
 | `src/voice.ts` | Proven PCM normalization, RMS silence gate, mic timeout, and cleanup. |
 | `src/glassEvents.ts` | Firmware event normalization and duplicate-safe gesture classification. |

@@ -1,5 +1,9 @@
 const SESSION_TIMEOUT_MS = 12_000
-const TURN_TIMEOUT_MS = 35_000
+const STATUS_TIMEOUT_MS = 8_000
+// 45 s, nao 35 s: o servidor pode gastar ate 30 s so de STT, mais dois snapshots da
+// sessao e o prompt.submit por RPC. Abortar em 35 s era desistir de um turno que o
+// backend estava prestes a aceitar — e a tentativa seguinte reenviava 1,28 MB a toa.
+const TURN_TIMEOUT_MS = 45_000
 
 export interface HermesTurn {
   id: string
@@ -16,11 +20,23 @@ export interface HermesSession {
   sessionId: string
   revision: string
   state: 'idle' | 'busy' | 'awaiting'
+  /** O servidor considera o turno travado. Ausente em backends anteriores a 2026-08-08. */
+  stuck: boolean
   progress: HermesProgress | null
   turns: HermesTurn[]
   cursor: number
   nextCursor: number | null
 }
+
+/** Resposta de GET /turn/:clientMsgId, ja normalizada. */
+export type TurnStatus =
+  | { kind: 'unknown' }
+  | { kind: 'pending' }
+  | { kind: 'done'; status: number; transcript: string }
+  /** A rota nao existe neste servidor: so resta inferir pela sessao. */
+  | { kind: 'missing' }
+  /** A rota existe mas nao respondeu agora: perguntar de novo, nunca inferir. */
+  | { kind: 'failed' }
 
 export interface VoiceTurnRequest {
   pcmB64: string
@@ -29,6 +45,8 @@ export interface VoiceTurnRequest {
   bitDepth: number
   clientMsgId: string
   expectedRevision: string
+  /** Pede para o servidor devolver a transcricao sem entregar nada a Iris. */
+  confirm: boolean
 }
 
 export interface VoiceTurnAccepted {
@@ -36,7 +54,19 @@ export interface VoiceTurnAccepted {
   sessionId: string
   clientMsgId: string
   transcript: string
+  /**
+   * O servidor transcreveu e PAROU: nada foi entregue a Iris ate o commit. Falso tambem
+   * quando o servidor e anterior a esta versao — la o campo `confirm` do pedido e ignorado
+   * e o turno segue direto, que e o comportamento de sempre.
+   */
+  staged: boolean
 }
+
+/** Resposta do commit, ja normalizada. */
+export type CommitResult =
+  | { kind: 'accepted'; transcript: string }
+  /** O servidor esqueceu este turno (restart, eviccao): so o audio recupera. */
+  | { kind: 'unknown' }
 
 export class ApiError extends Error {
   status: number
@@ -55,6 +85,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  // Sem AbortController o WebView pode pendurar a requisicao sem nunca rejeitar, e o HUD
+  // ficaria em PENSANDO para sempre. A corrida garante um fim mesmo nesse caso.
+  if (typeof AbortController === 'undefined') {
+    const pending = fetch(url, init)
+    pending.catch(() => {})
+    return Promise.race([
+      pending,
+      new Promise<Response>((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), timeoutMs),
+      ),
+    ])
+  }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -134,6 +176,7 @@ function normalizedSession(raw: unknown): HermesSession {
     sessionId: data.sessionId,
     revision: String(data.revision),
     state: data.state as HermesSession['state'],
+    stuck: data.stuck === true,
     progress,
     turns,
     cursor: Number.isInteger(data.cursor) ? Number(data.cursor) : 0,
@@ -166,42 +209,129 @@ export async function fetchHermesSession(cursor = 0): Promise<HermesSession> {
   throw new ApiError(0, 'Sem conexão com o HERMES.')
 }
 
-export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTurnAccepted> {
-  const payload = JSON.stringify(request)
-  let lastError: unknown
-  for (const delay of [0, 1_000, 3_000]) {
-    if (delay) await sleep(delay)
-    try {
-      const response = await fetchWithTimeout(
-        `${baseUrl()}/glass/hermes/turn`,
-        {
-          method: 'POST',
-          headers: { ...authHeaders(), 'content-type': 'application/json' },
-          body: payload,
-        },
-        TURN_TIMEOUT_MS,
-      )
-      if (!response.ok) throw await responseError(response)
-      const body = await response.json()
-      if (
-        body?.ok !== true ||
-        typeof body.sessionId !== 'string' ||
-        typeof body.clientMsgId !== 'string' ||
-        typeof body.transcript !== 'string'
-      ) {
-        throw new ApiError(502, 'Resposta inválida do HERMES.')
-      }
-      return {
-        ok: true,
-        sessionId: body.sessionId,
-        clientMsgId: body.clientMsgId,
-        transcript: body.transcript,
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) throw error
-      lastError = error
+// UMA tentativa. A escada de reenvio saiu daqui e virou a maquina de sendMachine.ts, que
+// pergunta ao servidor (GET /session, ~200 bytes) antes de decidir gastar outro upload de
+// ~1,28 MB. Repetir o mesmo clientMsgId e seguro: o servidor deduplica por
+// clientMsgId + fingerprint do audio e devolve o mesmo resultado, nunca um turno a mais.
+// `status === 0` e a marca de falha de rede/timeout — e o que separa "nao chegou" de
+// "chegou e o servidor recusou".
+// Pergunta pelo turno em vez de reenviar o audio. ~200 bytes contra ~1,28 MB.
+//
+// A distincao entre "o servidor nunca viu este id" (200 unknown) e "esta rota nao existe
+// aqui" (404) e o contrato inteiro: a primeira autoriza reenviar, a segunda manda usar o
+// caminho antigo. Nunca tratar as duas como a mesma coisa.
+export async function fetchTurnStatus(clientMsgId: string): Promise<TurnStatus> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/turn/${encodeURIComponent(clientMsgId)}`,
+      { headers: authHeaders() },
+      STATUS_TIMEOUT_MS,
+    )
+    // 404 e o unico "esta rota nao existe aqui". Timeout, 5xx e falha de rede sao a rota
+    // certa que nao respondeu AGORA — tratar os dois como a mesma coisa empurrava o
+    // cliente para a inferencia por revision, que e justamente onde ele erra.
+    if (response.status === 404) return { kind: 'missing' }
+    if (!response.ok) return { kind: 'failed' }
+    const body = await response.json()
+    if (body?.ok !== true) return { kind: 'failed' }
+    if (body.status === 'unknown') return { kind: 'unknown' }
+    if (body.status === 'pending') return { kind: 'pending' }
+    if (body.status === 'done' && Number.isFinite(body.turn?.status)) {
+      const transcript = typeof body.turn?.body?.transcript === 'string'
+        ? body.turn.body.transcript
+        : ''
+      return { kind: 'done', status: Number(body.turn.status), transcript }
     }
+    return { kind: 'failed' }
+  } catch {
+    return { kind: 'failed' }
   }
-  if (lastError instanceof ApiError) throw lastError
-  throw new ApiError(0, 'Não consegui enviar a mensagem.')
+}
+
+/**
+ * Solta um turno que o agente nao fecha sozinho.
+ *
+ * Distingue "esta rota nao existe aqui" de "existe e falhou" — colapsar as duas num
+ * booleano fazia um 401, um 502 ou um timeout serem anunciados como backend
+ * desatualizado, que e a mesma troca de diagnostico que custou quase uma hora em
+ * 2026-08-03.
+ */
+export type InterruptResult = 'ok' | 'missing' | 'failed'
+
+export async function interruptHermes(): Promise<InterruptResult> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/interrupt`,
+      { method: 'POST', headers: authHeaders() },
+      SESSION_TIMEOUT_MS,
+    )
+    if (response.ok) return 'ok'
+    return response.status === 404 ? 'missing' : 'failed'
+  } catch {
+    return 'failed'
+  }
+}
+
+export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTurnAccepted> {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/turn`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+      TURN_TIMEOUT_MS,
+    )
+    if (!response.ok) throw await responseError(response)
+    const body = await response.json()
+    if (
+      body?.ok !== true ||
+      typeof body.sessionId !== 'string' ||
+      typeof body.clientMsgId !== 'string' ||
+      typeof body.transcript !== 'string'
+    ) {
+      throw new ApiError(502, 'Resposta inválida do HERMES.')
+    }
+    return {
+      ok: true,
+      sessionId: body.sessionId,
+      clientMsgId: body.clientMsgId,
+      transcript: body.transcript,
+      // Servidor antigo devolve 202 sem `staged`: o turno JA foi entregue, e tratar isso
+      // como "esperando confirmacao" deixaria o John olhando uma tela que nao decide nada.
+      staged: response.status === 200 && body.staged === true,
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error
+    throw new ApiError(0, 'Não consegui enviar a mensagem.')
+  }
+}
+
+/**
+ * Entrega a Iris a transcricao que estava esperando o toque. ~200 bytes: o audio ja subiu.
+ *
+ * Idempotente por construcao — o servidor guarda o desfecho por clientMsgId —, entao um
+ * commit repetido devolve o mesmo turno em vez de perguntar duas vezes a mesma coisa.
+ */
+export async function commitTurn(
+  clientMsgId: string,
+  expectedRevision: string,
+): Promise<CommitResult> {
+  const response = await fetchWithTimeout(
+    `${baseUrl()}/glass/hermes/turn/${encodeURIComponent(clientMsgId)}/commit`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision }),
+    },
+    TURN_TIMEOUT_MS,
+  )
+  if (!response.ok) throw await responseError(response)
+  const body = await response.json()
+  if (response.status === 202 && typeof body?.transcript === 'string') {
+    return { kind: 'accepted', transcript: body.transcript }
+  }
+  if (body?.status === 'unknown') return { kind: 'unknown' }
+  throw new ApiError(502, 'Resposta inválida do HERMES.')
 }

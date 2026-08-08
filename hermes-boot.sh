@@ -17,6 +17,36 @@
 # Pegadinha: `set -u` SEM `-e` e proposital. Com `-e`, um curl falho mataria o boot;
 #   todo o fail-safe da instalacao depende de falha nao ser fatal.
 set -u
+
+# --- MODO INERTE (caminho de rollback da migracao para a Hetzner) -------------
+# IRIS_INERT=1 faz o container subir SO um respondedor de /health: sem gateway,
+# sem bridge do WhatsApp, sem scheduler, sem Tailscale. Existe para permitir
+# `railway ssh` no volume sem acordar consumidor nenhum -- que e a pre-condicao
+# do rollback, porque o deployment normal sobe bridge (segunda bridge -> loggedOut)
+# e faz refresh do token OAuth velho (revogacao permanente da cadeia).
+# NAO use `sleep infinity` aqui: railway.toml tem healthcheckPath=/health com
+# restartPolicyType=on_failure, entao um processo mudo faz o deploy fracassar em
+# laco e o modo inerte nunca fica alcancavel. Ver iris-inert.py.
+# FAIL-CLOSED de proposito, e o inverso do idioma usado no resto do arquivo.
+# Aqui a lista e do que DESLIGA; qualquer outro valor liga o modo inerte.
+#
+# O motivo: este e o caminho de rollback, digitado sob estresse. Uma allowlist de
+# truthy deixa `treu`, `true ` (com espaco) e `enabled` cairem no boot NORMAL --
+# que sobe a bridge (segunda bridge -> loggedOut) e faz refresh do token OAuth
+# velho, a catastrofe exata que o modo inerte existe para evitar. E o `--env-file`
+# do podman nao e shell: `IRIS_INERT="1"` pode chegar como o literal `"1"`.
+# Errar para o lado inerte custa um deploy; errar para o outro lado custa a
+# sessao do WhatsApp e a cadeia de OAuth.
+case "${IRIS_INERT:-0}" in
+  ""|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff])
+    : ;;                       # desligado: segue o boot normal
+  *)
+    echo "[hermes-boot-v3] IRIS_INERT=${IRIS_INERT} -- modo inerte, nada de gateway/bridge/scheduler/tailscale"
+    exec python3 /app/iris-inert.py
+    ;;
+esac
+# -----------------------------------------------------------------------------
+
 DRY_RUN="${DRY_RUN:-0}"
 TS_STATE_DIR="${TS_STATE_DIR:-/data/.tailscale}"
 TS_SOCK="/var/run/tailscale/tailscaled.sock"
