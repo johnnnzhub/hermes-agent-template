@@ -19,12 +19,20 @@ const PCM = Buffer.alloc(3_200, 1).toString("base64");
 async function createHttpHarness() {
   const harness = await createHarness();
   const transcripts = [];
+  // `hold-` segura a transcricao ate o teste soltar: e o unico jeito de observar um turno
+  // em voo, que e o estado que o GET /turn/:clientMsgId precisa reportar como "pending".
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
   const transcriber = {
     async transcribe(audio) {
       transcripts.push(audio.clientMsgId);
-      return audio.clientMsgId.startsWith("roles-")
-        ? "__history_roles__"
-        : `voz ${audio.clientMsgId}`;
+      if (audio.clientMsgId.startsWith("hold-")) await held;
+      if (audio.clientMsgId.startsWith("roles-")) return "__history_roles__";
+      // `__slow__` deixa o turno aberto no fake TUI: o `busy` que nunca fecha sozinho.
+      if (audio.clientMsgId.startsWith("slow-")) return "__slow__";
+      return `voz ${audio.clientMsgId}`;
     },
   };
   const app = createApp({
@@ -42,7 +50,9 @@ async function createHttpHarness() {
     ...harness,
     baseUrl: `http://127.0.0.1:${port}`,
     transcripts,
+    releaseTranscription: () => release(),
     async closeHttp() {
+      release();
       harness.events.close();
       await new Promise((resolve) => server.close(resolve));
       await harness.close();
@@ -266,4 +276,137 @@ test("rejects malformed audio before reaching STT", async (t) => {
   });
   assert.equal(bad.response.status, 400);
   assert.equal(harness.transcripts.length, 0);
+});
+
+async function getTurnStatus(harness, clientMsgId) {
+  const response = await fetch(
+    `${harness.baseUrl}/glass/hermes/turn/${clientMsgId}`,
+    { headers: glassHeaders() },
+  );
+  return { response, body: await response.json() };
+}
+
+async function postInterrupt(harness) {
+  const response = await fetch(`${harness.baseUrl}/glass/hermes/interrupt`, {
+    method: "POST",
+    headers: glassHeaders(),
+  });
+  return { response, body: await response.json() };
+}
+
+// Sem esta rota a unica forma de o cliente saber se um POST abortado chegou era reenviar
+// ~1,28 MB de audio ou adivinhar pela revision da sessao.
+test("turn status answers by id instead of forcing another audio upload", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const unknown = await getTurnStatus(harness, "nunca-vi-este-id");
+  assert.equal(unknown.response.status, 404);
+
+  const malformed = await getTurnStatus(harness, "curto");
+  assert.equal(malformed.response.status, 400);
+
+  const inFlight = postTurn(harness, {
+    clientMsgId: "hold-0001",
+    expectedRevision: before.body.revision,
+  });
+  await waitFor(() => harness.transcripts.includes("hold-0001"));
+  const pending = await getTurnStatus(harness, "hold-0001");
+  assert.equal(pending.response.status, 200);
+  assert.equal(pending.body.status, "pending");
+
+  harness.releaseTranscription();
+  const accepted = await inFlight;
+  assert.equal(accepted.response.status, 202);
+
+  const done = await getTurnStatus(harness, "hold-0001");
+  assert.equal(done.body.status, "done");
+  assert.equal(done.body.turn.status, 202);
+  assert.deepEqual(done.body.turn.body, accepted.body);
+  // O audio subiu uma vez so: a segunda pergunta custou uma linha de JSON.
+  assert.deepEqual(harness.transcripts, ["hold-0001"]);
+});
+
+test("turn status stays scoped to the glass credential", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const anonymous = await fetch(
+    `${harness.baseUrl}/glass/hermes/turn/qualquer-id`,
+  );
+  assert.equal(anonymous.status, 401);
+});
+
+// Ate aqui, um turno que nao fecha sozinho so saia com restart do container — que derruba
+// junto tudo o mais que roda nele.
+test("interrupt releases a turn that never settles on its own", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const accepted = await postTurn(harness, {
+    clientMsgId: "slow-00001",
+    expectedRevision: before.body.revision,
+  });
+  assert.equal(accepted.response.status, 202);
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId)?.state === "busy",
+  );
+
+  const stuckSession = await getSession(harness);
+  assert.equal(stuckSession.body.state, "busy");
+  const blocked = await postTurn(harness, {
+    clientMsgId: "slow-00002",
+    expectedRevision: stuckSession.body.revision,
+  });
+  assert.equal(blocked.response.status, 409);
+
+  const released = await postInterrupt(harness);
+  assert.equal(released.response.status, 200);
+  assert.equal(released.body.ok, true);
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId)?.state === "idle",
+  );
+  const recovered = await getSession(harness);
+  assert.equal(recovered.body.state, "idle");
+});
+
+test("session reports a stuck turn only past the ceiling", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+
+  const idle = await getSession(harness);
+  assert.equal(idle.body.stuck, false);
+
+  const realGetStatus = harness.provider.getStatus.bind(harness.provider);
+  harness.provider.getStatus = (sessionId) => ({
+    ...realGetStatus(sessionId),
+    state: "busy",
+    turnDurationMs: 299_999,
+  });
+  const slow = await getSession(harness);
+  assert.equal(slow.body.state, "busy");
+  assert.equal(slow.body.stuck, false);
+
+  harness.provider.getStatus = (sessionId) => ({
+    ...realGetStatus(sessionId),
+    state: "busy",
+    turnDurationMs: 300_000,
+  });
+  const stuck = await getSession(harness);
+  assert.equal(stuck.body.stuck, true);
+
+  harness.provider.getStatus = realGetStatus;
+});
+
+test("provider status carries how long the active turn has been running", async (t) => {
+  const harness = await createHarness();
+  t.after(() => harness.close());
+
+  assert.equal(harness.provider.getStatus(harness.sessionId).turnDurationMs, 0);
+  await harness.provider.prompt(harness.sessionId, "__slow__");
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId).turnDurationMs > 0,
+  );
+  await harness.provider.interrupt(harness.sessionId);
 });

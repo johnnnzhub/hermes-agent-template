@@ -11,6 +11,9 @@ const MAX_HISTORY_MESSAGES = 50;
 const DEFAULT_TURN_LIMIT = 6;
 const MAX_TURN_LIMIT = 10;
 const MAX_DEDUPE_ENTRIES = 128;
+// Acima disto o turno deixa de ser "demorado" e passa a ser reportado como travado, para
+// o cliente poder oferecer saida em vez de prometer uma resposta que talvez nunca venha.
+const STUCK_TURN_MS = 300_000;
 const CLIENT_MSG_ID = /^[A-Za-z0-9._:-]{6,80}$/;
 const REVISION = /^[a-f0-9]{16}$/;
 
@@ -261,10 +264,15 @@ async function sessionSnapshot(provider, events) {
   const state = status?.state ?? "idle";
   const history = await provider.getHistory(session.id, MAX_HISTORY_MESSAGES);
   const messages = visibleMessages(history, events, session.id, state);
+  const turnDurationMs = Number.isFinite(status?.turnDurationMs)
+    ? status.turnDurationMs
+    : 0;
   return {
     session,
     state,
     messages,
+    turnDurationMs,
+    stuck: state === "busy" && turnDurationMs >= STUCK_TURN_MS,
     revision: revisionFor(messages),
   };
 }
@@ -327,6 +335,7 @@ export function createGlassConversationRouter({
         sessionId: snapshot.session.id,
         revision: snapshot.revision,
         state: snapshot.state,
+        stuck: snapshot.stuck,
         progress: safeProgress(events, snapshot.session.id, snapshot.state),
         turns,
         cursor,
@@ -391,12 +400,16 @@ export function createGlassConversationRouter({
             return { status: mapped.status, body: { error: mapped.error } };
           }
         })();
-        entry = { fingerprint, pending };
+        entry = { fingerprint, pending, result: null };
         dedupe.set(audio.clientMsgId, entry);
         void pending.then((result) => {
           if (result.status >= 500 && dedupe.get(audio.clientMsgId) === entry) {
+            // Falha do servidor nao fica registrada: o cliente precisa poder reenviar, e
+            // o GET /turn/:clientMsgId devolver 404 e o que autoriza esse reenvio.
             dedupe.delete(audio.clientMsgId);
+            return;
           }
+          entry.result = result;
         });
         if (dedupe.size > MAX_DEDUPE_ENTRIES) {
           dedupe.delete(dedupe.keys().next().value);
@@ -404,6 +417,57 @@ export function createGlassConversationRouter({
       }
       const result = await entry.pending;
       res.status(result.status).json(result.body);
+    }),
+  );
+
+  // Status do turno por id, servido pelo mapa de deduplicacao que ja existia.
+  //
+  // Sem isto, a unica forma de o cliente descobrir se um POST abortado chegou era
+  // reenviar o audio inteiro (~1,28 MB) ou inferir pela revision da sessao. Aqui a
+  // resposta custa ~200 bytes e e definitiva. 404 significa "nunca vi este id" — e o
+  // unico caso em que reenviar o audio e realmente necessario.
+  router.get("/turn/:clientMsgId", (req, res) => {
+    const clientMsgId = String(req.params.clientMsgId ?? "");
+    if (!CLIENT_MSG_ID.test(clientMsgId)) {
+      res.status(400).json({ error: "clientMsgId inválido" });
+      return;
+    }
+    const entry = dedupe.get(clientMsgId);
+    if (!entry) {
+      res.status(404).json({ error: "Turno desconhecido" });
+      return;
+    }
+    if (!entry.result) {
+      res.json({ ok: true, status: "pending" });
+      return;
+    }
+    res.json({
+      ok: true,
+      status: "done",
+      turn: { status: entry.result.status, body: entry.result.body },
+    });
+  });
+
+  // Solta um turno que nao fecha sozinho. Ate aqui o unico jeito de sair de um `busy`
+  // permanente era reiniciar o container — que derruba junto tudo que roda nele.
+  router.post(
+    "/interrupt",
+    asyncRoute(async (_req, res) => {
+      const sessions = await provider.listSessions(1);
+      const session = sessions[0];
+      if (!session) throw new ProviderError("Iris session is unavailable", 503);
+      try {
+        await provider.interrupt(session.id);
+      } catch {
+        res.status(502).json({ error: "Não consegui interromper a Iris." });
+        return;
+      }
+      const snapshot = await sessionSnapshot(provider, events);
+      res.json({
+        ok: true,
+        state: snapshot.state,
+        revision: snapshot.revision,
+      });
     }),
   );
 
