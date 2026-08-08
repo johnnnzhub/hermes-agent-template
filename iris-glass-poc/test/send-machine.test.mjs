@@ -18,7 +18,7 @@ const start = () => startSend(ANCHOR)
 
 /** Falha de rede contra um backend sem a rota de status: cai no probe da sessao. */
 function legacyAsk(state) {
-  return reduce(reduce(state, { kind: 'network' }), { kind: 'status-unavailable' })
+  return reduce(reduce(state, { kind: 'network' }), { kind: 'status-missing' })
 }
 
 function exhaustLegacyLadder() {
@@ -105,9 +105,38 @@ test('insistir tem fim: o servidor tem o turno, entao vira PENSANDO com rascunho
 // Confundir "resposta HTTP" com "rota ausente" custou quase uma hora em 2026-08-03.
 test('rota de status ausente cai no caminho antigo em vez de falhar', () => {
   let state = reduce(start(), { kind: 'network' })
-  state = reduce(state, { kind: 'status-unavailable' })
+  state = reduce(state, { kind: 'status-missing' })
   assert.equal(state.phase, 'probe')
   assert.equal(state.attempts, 1)
+})
+
+// A inferencia por revision e o UNICO caminho do cliente capaz de apagar uma fala que
+// nunca foi entregue (outro turno muda a revision e ela e creditada a esta gravacao).
+// Por isso ela e reservada ao servidor que comprovadamente nao tem a rota — uma pergunta
+// que so falhou insiste, e nunca degrada para palpite.
+test('pergunta que falha insiste, e so cai no palpite depois de esgotar', () => {
+  let state = reduce(start(), { kind: 'network' })
+  const waits = []
+  for (let ask = 0; ask <= MAX_ASKS; ask++) {
+    state = reduce(state, { kind: 'status-failed' })
+    if (state.phase === 'wait') {
+      assert.equal(state.waitNext, 'ask')
+      waits.push(state.waitMs)
+      state = reduce(state, { kind: 'timer' })
+    }
+  }
+  assert.deepEqual(waits, ASK_DELAYS)
+  assert.equal(state.phase, 'probe')
+  // E nunca gastou outro upload no caminho.
+  assert.equal(state.attempts, 1)
+})
+
+test('a primeira falha da pergunta nao vira inferencia', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-failed' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'ask')
+  assert.notEqual(state.phase, 'probe')
 })
 
 test('probe com a sessao intacta agenda o degrau seguinte da escada', () => {

@@ -495,7 +495,8 @@ async function askTurn(turn: PendingTurn): Promise<SendEvent> {
   }
   if (status.kind === 'pending') return { kind: 'status-pending' }
   if (status.kind === 'unknown') return { kind: 'status-unknown' }
-  return { kind: 'status-unavailable' }
+  if (status.kind === 'missing') return { kind: 'status-missing' }
+  return { kind: 'status-failed' }
 }
 
 async function probeSession(): Promise<SendEvent> {

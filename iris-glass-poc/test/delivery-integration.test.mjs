@@ -84,7 +84,8 @@ async function ask(port, clientMsgId) {
       {},
       2_000,
     )
-    if (!response.ok) return { kind: 'status-unavailable' }
+    if (response.status === 404) return { kind: 'status-missing' }
+    if (!response.ok) return { kind: 'status-failed' }
     const body = await response.json()
     if (body.status === 'unknown') return { kind: 'status-unknown' }
     if (body.status === 'pending') return { kind: 'status-pending' }
@@ -95,9 +96,9 @@ async function ask(port, clientMsgId) {
         transcript: body.turn.body?.transcript ?? '',
       }
     }
-    return { kind: 'status-unavailable' }
+    return { kind: 'status-failed' }
   } catch {
-    return { kind: 'status-unavailable' }
+    return { kind: 'status-failed' }
   }
 }
 

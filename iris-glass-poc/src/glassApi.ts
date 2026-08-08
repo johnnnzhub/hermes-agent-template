@@ -33,8 +33,10 @@ export type TurnStatus =
   | { kind: 'unknown' }
   | { kind: 'pending' }
   | { kind: 'done'; status: number; transcript: string }
-  /** Rota ausente ou inalcancavel: usar o caminho antigo, que infere pela sessao. */
-  | { kind: 'unavailable' }
+  /** A rota nao existe neste servidor: so resta inferir pela sessao. */
+  | { kind: 'missing' }
+  /** A rota existe mas nao respondeu agora: perguntar de novo, nunca inferir. */
+  | { kind: 'failed' }
 
 export interface VoiceTurnRequest {
   pcmB64: string
@@ -211,9 +213,13 @@ export async function fetchTurnStatus(clientMsgId: string): Promise<TurnStatus> 
       { headers: authHeaders() },
       STATUS_TIMEOUT_MS,
     )
-    if (!response.ok) return { kind: 'unavailable' }
+    // 404 e o unico "esta rota nao existe aqui". Timeout, 5xx e falha de rede sao a rota
+    // certa que nao respondeu AGORA — tratar os dois como a mesma coisa empurrava o
+    // cliente para a inferencia por revision, que e justamente onde ele erra.
+    if (response.status === 404) return { kind: 'missing' }
+    if (!response.ok) return { kind: 'failed' }
     const body = await response.json()
-    if (body?.ok !== true) return { kind: 'unavailable' }
+    if (body?.ok !== true) return { kind: 'failed' }
     if (body.status === 'unknown') return { kind: 'unknown' }
     if (body.status === 'pending') return { kind: 'pending' }
     if (body.status === 'done' && Number.isFinite(body.turn?.status)) {
@@ -222,9 +228,9 @@ export async function fetchTurnStatus(clientMsgId: string): Promise<TurnStatus> 
         : ''
       return { kind: 'done', status: Number(body.turn.status), transcript }
     }
-    return { kind: 'unavailable' }
+    return { kind: 'failed' }
   } catch {
-    return { kind: 'unavailable' }
+    return { kind: 'failed' }
   }
 }
 

@@ -70,8 +70,10 @@ export type SendEvent =
   | { kind: 'status-pending' }
   /** O servidor ja concluiu este id; `turnStatus` e o que o POST teria devolvido. */
   | { kind: 'status-done'; turnStatus: number; transcript: string }
-  /** Rota por id ausente ou inalcancavel: cai para o probe da sessao. */
-  | { kind: 'status-unavailable' }
+  /** A rota por id nao existe neste servidor: so entao vale inferir pela sessao. */
+  | { kind: 'status-missing' }
+  /** A rota existe mas nao respondeu agora: perguntar de novo, nunca inferir. */
+  | { kind: 'status-failed' }
   | { kind: 'probe'; state: 'idle' | 'busy' | 'awaiting'; revision: string }
   | { kind: 'probe-failed' }
   /** O `wait` terminou. */
@@ -140,6 +142,22 @@ function afterInconclusiveProbe(state: SendState): SendState {
   if (state.attempts >= MAX_POSTS) return park(state, 'exhausted')
   const waitMs = RETRY_DELAYS[Math.min(state.attempts - 1, RETRY_DELAYS.length - 1)]
   return { ...state, phase: 'wait', waitMs, waitNext: 'post' }
+}
+
+/**
+ * A pergunta em si falhou. Insiste — e so depois de esgotar cai para a inferencia por
+ * revision, que e o unico caminho do cliente capaz de apagar uma fala nao entregue.
+ */
+function afterFailedAsk(state: SendState): SendState {
+  const asks = state.asks + 1
+  if (asks > MAX_ASKS) return { ...state, phase: 'probe', waitMs: 0, asks }
+  return {
+    ...state,
+    phase: 'wait',
+    waitMs: ASK_DELAYS[Math.min(asks - 1, ASK_DELAYS.length - 1)],
+    waitNext: 'ask',
+    asks,
+  }
 }
 
 /** O servidor confirmou que tem o id: insiste barato antes de dar o turno como em curso. */
@@ -212,9 +230,10 @@ export function reduce(state: SendState, event: SendEvent): SendState {
       }
       if (event.kind === 'status-pending') return afterPendingAsk(state)
       if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
-      // Rota ausente (servidor anterior a esta versao) ou inalcancavel: o caminho antigo,
-      // que infere pela revision da sessao, continua valendo.
-      if (event.kind === 'status-unavailable') return { ...state, phase: 'probe', waitMs: 0 }
+      // Rota ausente (servidor anterior a esta versao): o caminho antigo, que infere pela
+      // revision da sessao, e tudo o que resta.
+      if (event.kind === 'status-missing') return { ...state, phase: 'probe', waitMs: 0 }
+      if (event.kind === 'status-failed') return afterFailedAsk(state)
       return state
     }
 
