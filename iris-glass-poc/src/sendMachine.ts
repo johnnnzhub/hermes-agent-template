@@ -139,6 +139,16 @@ export function parkedDraft(anchorRevision: string): SendState {
   return { ...BASE, phase: 'retry', anchorRevision, reason: 'saved' }
 }
 
+/**
+ * Rascunho que ja tinha sido transcrito quando o app fechou. Volta direto para a tela de
+ * confirmacao: o servidor provavelmente ainda tem o turno retido, entao o toque entrega com
+ * ~200 bytes em vez de subir 1,28 MB de audio de novo. Se ele tiver esquecido, o commit
+ * responde "unknown" e a escada de upload assume.
+ */
+export function stagedDraft(anchorRevision: string, transcript: string): SendState {
+  return { ...BASE, phase: 'staged', anchorRevision, transcript }
+}
+
 function park(state: SendState, reason: SendReason, needsRefresh = false): SendState {
   return { ...state, phase: 'retry', waitMs: 0, reason, needsRefresh }
 }
@@ -183,7 +193,10 @@ function toAsk(state: SendState, reason: SendReason): SendState {
 /** Depois de uma resposta inconclusiva: espera o degrau da escada, ou desiste. */
 function afterInconclusiveProbe(state: SendState): SendState {
   if (state.attempts >= MAX_POSTS) return park(state, 'exhausted')
-  const waitMs = RETRY_DELAYS[Math.min(state.attempts - 1, RETRY_DELAYS.length - 1)]
+  // O clamp inferior importa: um rascunho ja transcrito, restaurado do disco, chega aqui
+  // com zero POSTs nesta sessao, e o indice -1 daria um degrau `undefined`.
+  const step = Math.max(0, Math.min(state.attempts - 1, RETRY_DELAYS.length - 1))
+  const waitMs = RETRY_DELAYS[step]
   return { ...state, phase: 'wait', waitMs, waitNext: 'post' }
 }
 

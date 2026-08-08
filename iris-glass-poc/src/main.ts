@@ -52,6 +52,7 @@ import {
   reasonHeadline,
   reduce,
   settlePending,
+  stagedDraft,
   startSend,
   type SendEvent,
   type SendState,
@@ -888,10 +889,15 @@ function restoreDraft() {
   // Rascunho de uma sessao anterior nao sai sozinho: reenviar uma fala de minutos atras
   // sem aviso seria surpresa. Fica oferecido ate o toque.
   pending = saved
-  sendState = parkedDraft(saved.expectedRevision)
+  // Rascunho com transcricao ja passou pelo servidor e ficou retido esperando o toque:
+  // volta para a confirmacao, nao para a escada de upload. O John le a mesma frase que
+  // leu antes de fechar, e confirmar custa ~200 bytes em vez de outro 1,28 MB.
+  sendState = saved.transcript
+    ? stagedDraft(saved.expectedRevision, saved.transcript)
+    : parkedDraft(saved.expectedRevision)
   // Veio do disco, entao esta no disco.
   draftOnDisk = true
-  mode = 'retry'
+  mode = restingMode()
   renderState()
 }
 

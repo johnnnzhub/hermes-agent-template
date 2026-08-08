@@ -9,6 +9,7 @@ import {
   reasonHeadline,
   reduce,
   settlePending,
+  stagedDraft,
   startSend,
 } from '../src/sendMachine.ts'
 
@@ -486,4 +487,26 @@ test('servidor antigo entrega direto e nao mostra confirmacao', () => {
   const state = reduce(start(), { kind: 'accepted', transcript: 'oi' })
   assert.equal(state.phase, 'thinking')
   assert.equal(state.clearDraft, true)
+})
+
+// Rascunho ja transcrito, restaurado depois de fechar o app: o servidor provavelmente
+// ainda tem o turno retido, entao o toque deve ENTREGAR, nao subir 1,28 MB de novo.
+test('rascunho transcrito volta para a confirmacao, nao para o upload', () => {
+  let state = stagedDraft(ANCHOR, 'quanto pesa um litro de agua')
+  assert.equal(state.phase, 'staged')
+  assert.equal(state.transcript, 'quanto pesa um litro de agua')
+  state = reduce(state, { kind: 'manual' })
+  assert.equal(state.phase, 'commit')
+  assert.equal(state.attempts, 0)
+})
+
+// E se o servidor tiver esquecido o turno, o commit devolve "unknown" e a escada de upload
+// assume — com zero POSTs nesta sessao, o degrau nao pode sair `undefined`.
+test('turno esquecido apos restaurar cai num degrau valido da escada', () => {
+  let state = reduce(stagedDraft(ANCHOR, 'oi'), { kind: 'manual' })
+  state = reduce(state, { kind: 'status-unknown' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'post')
+  assert.equal(state.waitMs, RETRY_DELAYS[0])
+  assert.equal(reduce(state, { kind: 'timer' }).phase, 'post')
 })
