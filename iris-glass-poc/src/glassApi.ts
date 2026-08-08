@@ -45,6 +45,8 @@ export interface VoiceTurnRequest {
   bitDepth: number
   clientMsgId: string
   expectedRevision: string
+  /** Pede para o servidor devolver a transcricao sem entregar nada a Iris. */
+  confirm: boolean
 }
 
 export interface VoiceTurnAccepted {
@@ -52,7 +54,19 @@ export interface VoiceTurnAccepted {
   sessionId: string
   clientMsgId: string
   transcript: string
+  /**
+   * O servidor transcreveu e PAROU: nada foi entregue a Iris ate o commit. Falso tambem
+   * quando o servidor e anterior a esta versao — la o campo `confirm` do pedido e ignorado
+   * e o turno segue direto, que e o comportamento de sempre.
+   */
+  staged: boolean
 }
+
+/** Resposta do commit, ja normalizada. */
+export type CommitResult =
+  | { kind: 'accepted'; transcript: string }
+  /** O servidor esqueceu este turno (restart, eviccao): so o audio recupera. */
+  | { kind: 'unknown' }
 
 export class ApiError extends Error {
   status: number
@@ -284,9 +298,40 @@ export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTur
       sessionId: body.sessionId,
       clientMsgId: body.clientMsgId,
       transcript: body.transcript,
+      // Servidor antigo devolve 202 sem `staged`: o turno JA foi entregue, e tratar isso
+      // como "esperando confirmacao" deixaria o John olhando uma tela que nao decide nada.
+      staged: response.status === 200 && body.staged === true,
     }
   } catch (error) {
     if (error instanceof ApiError) throw error
     throw new ApiError(0, 'Não consegui enviar a mensagem.')
   }
+}
+
+/**
+ * Entrega a Iris a transcricao que estava esperando o toque. ~200 bytes: o audio ja subiu.
+ *
+ * Idempotente por construcao — o servidor guarda o desfecho por clientMsgId —, entao um
+ * commit repetido devolve o mesmo turno em vez de perguntar duas vezes a mesma coisa.
+ */
+export async function commitTurn(
+  clientMsgId: string,
+  expectedRevision: string,
+): Promise<CommitResult> {
+  const response = await fetchWithTimeout(
+    `${baseUrl()}/glass/hermes/turn/${encodeURIComponent(clientMsgId)}/commit`,
+    {
+      method: 'POST',
+      headers: { ...authHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision }),
+    },
+    TURN_TIMEOUT_MS,
+  )
+  if (!response.ok) throw await responseError(response)
+  const body = await response.json()
+  if (response.status === 202 && typeof body?.transcript === 'string') {
+    return { kind: 'accepted', transcript: body.transcript }
+  }
+  if (body?.status === 'unknown') return { kind: 'unknown' }
+  throw new ApiError(502, 'Resposta inválida do HERMES.')
 }

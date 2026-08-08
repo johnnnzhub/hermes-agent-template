@@ -14,6 +14,10 @@ const MAX_DEDUPE_ENTRIES = 128;
 // Acima disto o turno deixa de ser "demorado" e passa a ser reportado como travado, para
 // o cliente poder oferecer saida em vez de prometer uma resposta que talvez nunca venha.
 const STUCK_TURN_MS = 300_000;
+// Transcricao que espera confirmacao do John. Passado esse tempo o turno e esquecido: o
+// rascunho no oculos vive 15 min, entao o cliente ainda consegue regravar a decisao em vez
+// de mandar para a Iris uma frase que ele falou meia hora antes.
+const STAGED_TTL_MS = 600_000;
 const CLIENT_MSG_ID = /^[A-Za-z0-9._:-]{6,80}$/;
 const REVISION = /^[a-f0-9]{16}$/;
 
@@ -159,6 +163,7 @@ function validateAudioBody(body) {
     bitDepth,
     clientMsgId,
     expectedRevision,
+    confirm,
   } = body ?? {};
   if (!CLIENT_MSG_ID.test(String(clientMsgId ?? ""))) {
     return { error: "clientMsgId inválido" };
@@ -195,6 +200,10 @@ function validateAudioBody(body) {
       bitDepth,
       clientMsgId,
       expectedRevision,
+      // Cliente que pede confirmacao recebe a transcricao e NADA e submetido a Iris ate o
+      // commit. Campo desconhecido para clientes antigos e para servidores antigos: la ele
+      // e ignorado e o turno segue direto, que e o comportamento de sempre.
+      confirm: confirm === true,
     },
   };
 }
@@ -344,6 +353,29 @@ export function createGlassConversationRouter({
     }),
   );
 
+  /**
+   * Entrega a fala ao agente. Extraido do POST /turn porque o commit precisa exatamente
+   * disto — e a checagem de revision tem de ser refeita no instante da submissao, nao
+   * herdada do momento em que o audio subiu.
+   */
+  async function submitTranscript(clientMsgId, transcript, expectedRevision) {
+    const snapshot = await sessionSnapshot(provider, events);
+    if (snapshot.state !== "idle") {
+      return { status: 409, body: { error: "A Iris já está trabalhando." } };
+    }
+    if (snapshot.revision !== expectedRevision) {
+      return {
+        status: 409,
+        body: { error: "A conversa mudou; atualize antes de enviar." },
+      };
+    }
+    const accepted = await provider.prompt(snapshot.session.id, transcript);
+    return {
+      status: 202,
+      body: { ok: true, sessionId: accepted.sessionId, clientMsgId, transcript },
+    };
+  }
+
   router.post(
     "/turn",
     asyncRoute(async (req, res) => {
@@ -364,7 +396,7 @@ export function createGlassConversationRouter({
       if (!entry) {
         const pending = (async () => {
           try {
-            let snapshot = await sessionSnapshot(provider, events);
+            const snapshot = await sessionSnapshot(provider, events);
             if (snapshot.state !== "idle") {
               return { status: 409, body: { error: "A Iris já está trabalhando." } };
             }
@@ -375,32 +407,34 @@ export function createGlassConversationRouter({
               };
             }
             const transcript = await transcriber.transcribe(audio);
-            snapshot = await sessionSnapshot(provider, events);
-            if (snapshot.state !== "idle") {
-              return { status: 409, body: { error: "A Iris já está trabalhando." } };
-            }
-            if (snapshot.revision !== audio.expectedRevision) {
+            // Confirmacao pedida: a transcricao volta e PARA aqui. Nada e submetido a Iris
+            // ate o commit, entao o John le o que o servidor entendeu antes de a frase
+            // virar acao. 200, nao 202: 202 significa "aceito para processamento", e este
+            // turno explicitamente ainda nao foi.
+            if (audio.confirm) {
               return {
-                status: 409,
-                body: { error: "A conversa mudou; atualize antes de enviar." },
+                status: 200,
+                stagedAt: Date.now(),
+                body: {
+                  ok: true,
+                  staged: true,
+                  sessionId: snapshot.session.id,
+                  clientMsgId: audio.clientMsgId,
+                  transcript,
+                },
               };
             }
-            const accepted = await provider.prompt(snapshot.session.id, transcript);
-            return {
-              status: 202,
-              body: {
-                ok: true,
-                sessionId: accepted.sessionId,
-                clientMsgId: audio.clientMsgId,
-                transcript,
-              },
-            };
+            return await submitTranscript(
+              audio.clientMsgId,
+              transcript,
+              audio.expectedRevision,
+            );
           } catch (error) {
             const mapped = publicError(error);
             return { status: mapped.status, body: { error: mapped.error } };
           }
         })();
-        entry = { fingerprint, pending, result: null };
+        entry = { fingerprint, pending, result: null, commit: null };
         dedupe.set(audio.clientMsgId, entry);
         void pending.then((result) => {
           if (result.status >= 500 && dedupe.get(audio.clientMsgId) === entry) {
@@ -451,6 +485,72 @@ export function createGlassConversationRouter({
       turn: { status: entry.result.status, body: entry.result.body },
     });
   });
+
+  /**
+   * Entrega a Iris uma transcricao que ficou esperando confirmacao.
+   *
+   * Custa ~200 bytes: o audio ja subiu e nao sobe de novo. Idempotente — commit repetido
+   * devolve o mesmo 202, nunca um segundo turno —, e a revision e checada AGORA, porque
+   * entre a transcricao e o toque do John a conversa pode ter andado por outro canal.
+   */
+  router.post(
+    "/turn/:clientMsgId/commit",
+    asyncRoute(async (req, res) => {
+      const clientMsgId = String(req.params.clientMsgId ?? "");
+      if (!CLIENT_MSG_ID.test(clientMsgId)) {
+        res.status(400).json({ error: "clientMsgId inválido" });
+        return;
+      }
+      const expectedRevision = String(req.body?.expectedRevision ?? "");
+      if (!REVISION.test(expectedRevision)) {
+        res.status(400).json({ error: "expectedRevision inválida" });
+        return;
+      }
+      const entry = dedupe.get(clientMsgId);
+      if (!entry) {
+        // 200 "unknown" pela mesma razao do GET: o catch-all deste router responde 404, e o
+        // cliente precisa poder separar "esqueci este turno" de "esta rota nao existe".
+        res.json({ ok: true, status: "unknown" });
+        return;
+      }
+      // `entry.result` pode ja ter sido substituido por um commit anterior; `entry.pending`
+      // e sempre o desfecho do POST original.
+      const staged = entry.result ?? (await entry.pending);
+      if (staged.status !== 200 || staged.body?.staged !== true) {
+        // Nada a confirmar: ou ja foi entregue (202, e repetir devolve o mesmo), ou o
+        // proprio POST falhou e o erro dele continua sendo a resposta honesta.
+        res.status(staged.status).json(staged.body);
+        return;
+      }
+      if (Date.now() - (staged.stagedAt ?? 0) > STAGED_TTL_MS) {
+        dedupe.delete(clientMsgId);
+        res.json({ ok: true, status: "unknown" });
+        return;
+      }
+      if (!entry.commit) {
+        entry.commit = submitTranscript(
+          clientMsgId,
+          staged.body.transcript,
+          expectedRevision,
+        ).catch((error) => {
+          const mapped = publicError(error);
+          return { status: mapped.status, body: { error: mapped.error } };
+        });
+        void entry.commit.then((result) => {
+          if (result.status === 202) {
+            // Desfecho definitivo: e o que o GET /turn/:id passa a responder.
+            entry.result = result;
+            return;
+          }
+          // 409 e 5xx nao gravam: a conversa pode voltar a idle e o mesmo toque, mais
+          // tarde, deve poder entregar a fala em vez de repetir um erro velho.
+          entry.commit = null;
+        });
+      }
+      const committed = await entry.commit;
+      res.status(committed.status).json(committed.body);
+    }),
+  );
 
   // Solta um turno que nao fecha sozinho. Ate aqui o unico jeito de sair de um `busy`
   // permanente era reiniciar o container — que derruba junto tudo que roda nele.

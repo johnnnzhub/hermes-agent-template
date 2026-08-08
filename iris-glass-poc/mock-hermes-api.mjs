@@ -74,6 +74,46 @@ createServer((request, response) => {
     return send(response, 200, { ok: true, status: 'done', turn: result })
   }
 
+  // Entrega a transcricao retida. Idempotente: repetir devolve o mesmo 202.
+  if (
+    request.method === 'POST' &&
+    url.pathname.startsWith('/glass/hermes/turn/') &&
+    url.pathname.endsWith('/commit')
+  ) {
+    if (legacy) return send(response, 404, { error: 'Not found' })
+    const clientMsgId = decodeURIComponent(
+      url.pathname.slice('/glass/hermes/turn/'.length, -'/commit'.length),
+    )
+    let raw = ''
+    request.on('data', chunk => { raw += chunk })
+    request.on('end', () => {
+      const body = JSON.parse(raw || '{}')
+      const staged = turnResults.get(clientMsgId)
+      if (!turnResults.has(clientMsgId)) return send(response, 200, { ok: true, status: 'unknown' })
+      if (!staged || staged.status !== 200) {
+        return send(response, staged?.status ?? 200, staged?.body ?? { ok: true, status: 'unknown' })
+      }
+      if (body.expectedRevision && body.expectedRevision !== revision()) {
+        return send(response, 409, { error: 'A conversa mudou; atualize antes de enviar.' })
+      }
+      turns.push({
+        id: clientMsgId,
+        user: 'Mensagem de voz simulada',
+        assistant: 'Resposta simulada do HERMES.',
+      })
+      busyUntil = Date.now() + 2_000
+      const payload = {
+        ok: true,
+        sessionId: 'mock-hermes-session',
+        clientMsgId,
+        transcript: 'Mensagem de voz simulada',
+      }
+      turnResults.set(clientMsgId, { status: 202, body: payload })
+      send(response, 202, payload)
+    })
+    return
+  }
+
   if (request.method === 'POST' && url.pathname === '/glass/hermes/turn') {
     let raw = ''
     request.on('data', chunk => { raw += chunk })
@@ -115,6 +155,18 @@ createServer((request, response) => {
       if (!body.clientMsgId || !body.pcmB64) return send(response, 400, { error: 'Áudio inválido' })
       if (body.expectedRevision && body.expectedRevision !== revision()) {
         return finish(409, { error: 'A conversa mudou; atualize antes de enviar.' })
+      }
+      // Confirmacao pedida: transcreve e PARA. Nenhum turno entra na conversa, entao a
+      // revision nao muda — que e exatamente o que o cliente precisa ver para saber que a
+      // fala ainda nao foi entregue.
+      if (body.confirm && !legacy) {
+        return finish(200, {
+          ok: true,
+          staged: true,
+          sessionId: 'mock-hermes-session',
+          clientMsgId: body.clientMsgId,
+          transcript: 'Mensagem de voz simulada',
+        })
       }
       turns.push({
         id: body.clientMsgId,

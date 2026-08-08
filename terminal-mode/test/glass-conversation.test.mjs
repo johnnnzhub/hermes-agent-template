@@ -286,6 +286,118 @@ async function getTurnStatus(harness, clientMsgId) {
   return { response, body: await response.json() };
 }
 
+async function postCommit(harness, clientMsgId, expectedRevision) {
+  const response = await fetch(
+    `${harness.baseUrl}/glass/hermes/turn/${clientMsgId}/commit`,
+    {
+      method: "POST",
+      headers: { ...glassHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
+    },
+  );
+  return { response, body: await response.json() };
+}
+
+// A fala vira acao no instante em que chega na Iris. Confirmar depois do STT e a unica
+// janela possivel: antes dele ninguem sabe o que foi dito, nem o oculos nem o servidor.
+test("confirmação retém a transcrição e só entrega no commit", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const staged = await postTurn(harness, {
+    clientMsgId: "confirm-0001",
+    expectedRevision: before.body.revision,
+    confirm: true,
+  });
+  assert.equal(staged.response.status, 200);
+  assert.equal(staged.body.staged, true);
+  assert.equal(staged.body.transcript, "voz confirm-0001");
+  // O ponto inteiro: transcreveu e NAO submeteu.
+  assert.deepEqual(harness.transcripts, ["confirm-0001"]);
+  assert.equal(harness.provider.getStatus(harness.sessionId)?.state, "idle");
+  const untouched = await getSession(harness);
+  assert.equal(untouched.body.revision, before.body.revision);
+
+  const committed = await postCommit(
+    harness,
+    "confirm-0001",
+    before.body.revision,
+  );
+  assert.equal(committed.response.status, 202);
+  assert.equal(committed.body.transcript, "voz confirm-0001");
+  // O commit nao reenvia audio: o STT roda uma vez so.
+  assert.deepEqual(harness.transcripts, ["confirm-0001"]);
+  await waitFor(
+    () => harness.provider.getStatus(harness.sessionId)?.state === "idle",
+  );
+
+  // Repetir o commit devolve o mesmo turno, nunca um segundo.
+  const again = await postCommit(harness, "confirm-0001", before.body.revision);
+  assert.equal(again.response.status, 202);
+  assert.deepEqual(again.body, committed.body);
+
+  // E o status por id passa a contar o desfecho definitivo.
+  const status = await getTurnStatus(harness, "confirm-0001");
+  assert.equal(status.body.status, "done");
+  assert.equal(status.body.turn.status, 202);
+});
+
+// Entre a transcricao e o toque do John a conversa pode andar por outro canal (o atalho do
+// iPhone, o terminal). Herdar a revision do momento do upload injetaria a fala num contexto
+// que ele nao leu.
+test("commit confere a revisão no instante da entrega, não na do upload", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const staged = await postTurn(harness, {
+    clientMsgId: "confirm-0002",
+    expectedRevision: before.body.revision,
+    confirm: true,
+  });
+  assert.equal(staged.response.status, 200);
+
+  const stale = await postCommit(harness, "confirm-0002", "0".repeat(16));
+  assert.equal(stale.response.status, 409);
+  assert.match(stale.body.error, /conversa mudou/);
+  assert.equal(harness.provider.getStatus(harness.sessionId)?.state, "idle");
+
+  // O 409 nao queima o turno: com a revision certa o mesmo toque entrega.
+  const ok = await postCommit(harness, "confirm-0002", before.body.revision);
+  assert.equal(ok.response.status, 202);
+});
+
+// Commit de um id que o servidor esqueceu (restart, eviccao) nao pode virar 404: o cliente
+// tem de conseguir separar "esqueci este turno" de "esta rota nao existe aqui".
+test("commit de turno desconhecido responde unknown, não 404", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const missing = await postCommit(harness, "sumiu-0001", before.body.revision);
+  assert.equal(missing.response.status, 200);
+  assert.equal(missing.body.status, "unknown");
+
+  const invalid = await postCommit(harness, "x", before.body.revision);
+  assert.equal(invalid.response.status, 400);
+});
+
+// Cliente antigo (v0.4.3) nao manda `confirm`, e o campo desconhecido nao pode mudar nada
+// para ele: o turno segue direto para a Iris como sempre.
+test("sem confirm o turno vai direto, como no cliente antigo", async (t) => {
+  const harness = await createHttpHarness();
+  t.after(() => harness.closeHttp());
+  const before = await getSession(harness);
+
+  const accepted = await postTurn(harness, {
+    clientMsgId: "direto-0001",
+    expectedRevision: before.body.revision,
+  });
+  assert.equal(accepted.response.status, 202);
+  assert.equal(accepted.body.staged, undefined);
+});
+
 async function postInterrupt(harness) {
   const response = await fetch(`${harness.baseUrl}/glass/hermes/interrupt`, {
     method: "POST",

@@ -21,6 +21,13 @@ export type SendPhase =
   | 'ask'
   /** Fallback do `ask`: GET /session, quando a rota por id nao existe no servidor. */
   | 'probe'
+  /**
+   * O servidor transcreveu e segurou: nada foi entregue a Iris. Espera o toque do John.
+   * Nao ha relogio aqui — quem decide e ele, e o rascunho continua guardado.
+   */
+  | 'staged'
+  /** Entregando a transcricao ja confirmada. ~200 bytes, sem reenviar audio. */
+  | 'commit'
   /** Esperar `waitMs` antes do proximo POST. */
   | 'wait'
   /** O servidor tem o turno; seguir para o poll da resposta. */
@@ -77,6 +84,8 @@ export interface SendState {
 
 export type SendEvent =
   | { kind: 'accepted'; transcript: string }
+  /** O servidor devolveu a transcricao sem entregar nada: espera confirmacao. */
+  | { kind: 'staged'; transcript: string }
   | { kind: 'http'; status: number }
   | { kind: 'network' }
   /** O servidor nunca viu este clientMsgId: o turno realmente nao chegou. */
@@ -158,6 +167,14 @@ function accept(state: SendState, transcript: string): SendState {
   }
 }
 
+/**
+ * Transcrito e retido: a fala ainda NAO foi entregue, entao o rascunho fica. So o toque do
+ * John move daqui — e por isso este estado nao tem timer nem escada.
+ */
+function stage(state: SendState, transcript: string): SendState {
+  return { ...state, phase: 'staged', waitMs: 0, reason: 'none', transcript }
+}
+
 /** Falha reciclavel: pergunta antes de gastar outro upload. */
 function toAsk(state: SendState, reason: SendReason): SendState {
   return { ...state, phase: 'ask', waitMs: 0, reason }
@@ -230,6 +247,8 @@ function fromHttp(state: SendState, status: number): SendState {
 export function reduce(state: SendState, event: SendEvent): SendState {
   // O toque do usuario vale em qualquer estado parado e reabre a escada inteira.
   if (event.kind === 'manual') {
+    // Confirmacao: o toque nao reenvia audio nenhum, so libera o que o servidor ja tem.
+    if (state.phase === 'staged') return { ...state, phase: 'commit', waitMs: 0 }
     if (state.phase !== 'retry' && state.phase !== 'wait') return state
     // Esperando para PERGUNTAR de novo: o servidor ja confirmou que tem o turno, entao
     // apressar nao pode virar reenvio dos ~1,28 MB.
@@ -251,8 +270,25 @@ export function reduce(state: SendState, event: SendEvent): SendState {
     case 'post': {
       const posted = { ...state, attempts: state.attempts + 1 }
       if (event.kind === 'accepted') return accept(posted, event.transcript)
+      if (event.kind === 'staged') return stage(posted, event.transcript)
       if (event.kind === 'http') return fromHttp(posted, event.status)
       if (event.kind === 'network') return toAsk(posted, 'network')
+      return state
+    }
+
+    // Esperando o John. Nada acontece sozinho aqui: nem timer, nem reenvio, nem descarte.
+    case 'staged':
+      return state
+
+    case 'commit': {
+      if (event.kind === 'accepted') return accept(state, event.transcript)
+      // O servidor esqueceu o turno (restart, eviccao). O audio ainda esta no rascunho,
+      // entao o caminho e subir de novo — e confirmar de novo.
+      if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
+      if (event.kind === 'http') return fromHttp(state, event.status)
+      // O commit e barato, mas a duvida e a mesma de sempre: perguntar por id custa menos
+      // que adivinhar, e responde se a fala entrou.
+      if (event.kind === 'network') return toAsk(state, 'network')
       return state
     }
 
@@ -260,6 +296,10 @@ export function reduce(state: SendState, event: SendEvent): SendState {
       // Resposta definitiva do servidor sobre ESTE id — nao inferencia sobre a sessao.
       if (event.kind === 'status-done') {
         if (event.turnStatus === 202) return accept(state, event.transcript)
+        // 200: transcrito e retido. A fala NAO foi entregue, entao o rascunho fica e o HUD
+        // volta a pedir o toque. Cair no fromHttp aqui pararia com "HERMES FORA DO AR"
+        // diante de um servidor que esta apenas esperando a decisao do John.
+        if (event.turnStatus === 200) return stage(state, event.transcript)
         return fromHttp(state, event.turnStatus)
       }
       if (event.kind === 'status-pending') return afterPendingAsk(state)

@@ -54,6 +54,11 @@ const REQUIRED = [
   // disco precisa dizer isso em vez de se passar por recuperavel.
   'ROLAR DE NOVO = APAGAR A FALA',
   'SÓ NESTA SESSÃO · NÃO FECHE',
+  // Contrato da v0.8.0: nada chega a Iris sem o toque. Sem estas strings o bundle voltou a
+  // entregar a fala direto, que e justamente o que a confirmacao existe para impedir.
+  'CONFIRMAR',
+  'TOQUE = ENVIAR',
+  /\/commit/,
 ]
 
 const envKeys = ['VITE_GLASS_DIAG', 'VITE_HERMES_API_BASE']

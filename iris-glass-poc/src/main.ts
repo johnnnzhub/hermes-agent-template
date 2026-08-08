@@ -7,6 +7,7 @@ import {
 import { classifyGlassEvent, summarizeGlassEvent } from './glassEvents'
 import {
   ApiError,
+  commitTurn,
   fetchHermesSession,
   fetchTurnStatus,
   interruptHermes,
@@ -143,7 +144,7 @@ async function renderNow() {
   }
 }
 
-type LocalMode = 'loading' | 'history' | 'recording' | 'sending' | 'retry' | 'error'
+type LocalMode = 'loading' | 'history' | 'recording' | 'sending' | 'confirm' | 'retry' | 'error'
 
 let mode: LocalMode = 'loading'
 let revision = ''
@@ -241,6 +242,25 @@ function retryContent(): string {
   return lines.join('\n')
 }
 
+/**
+ * A fala vira acao no instante em que chega na Iris, e nao da para desfazer o que ela ja
+ * fez. Esta tela e a janela entre "o servidor entendeu" e "a Iris agiu" — a unica possivel,
+ * porque antes do STT ninguem sabe o que foi dito.
+ */
+function confirmContent(): string {
+  if (!sendState || !pending) return emptyContent()
+  // O texto e o que o SERVIDOR entendeu, nunca o resumo do rascunho: confirmar sem ver a
+  // transcricao seria confirmar no escuro.
+  const heard = sendState.transcript || draftSummary(pending)
+  const lines = ['CONFIRMAR', ...wrapHudText(`» ${heard}`).slice(0, 4)]
+  if (discardArmed) {
+    lines.push('ROLAR DE NOVO = APAGAR A FALA', 'TOQUE = ENVIAR')
+    return lines.join('\n')
+  }
+  lines.push('TOQUE = ENVIAR', 'ROLAR PRA CIMA = DESCARTAR')
+  return lines.join('\n')
+}
+
 function emptyContent(): string {
   return 'HERMES'
 }
@@ -249,6 +269,7 @@ function contentForState(): string {
   if (mode === 'loading') return INITIAL_TEXT
   if (mode === 'recording') return 'OUVINDO'
   if (mode === 'sending') return sendingContent()
+  if (mode === 'confirm') return confirmContent()
   if (mode === 'retry') return retryContent()
   if (mode === 'error') return notice || 'NÃO FOI POSSÍVEL CONTINUAR'
   // Rascunho sem desfecho com a sessao ja em idle continua sendo espera: mostrar o
@@ -273,7 +294,9 @@ function clearNoticeTimer() {
 
 /** Estado de repouso: o rascunho pendente manda no HUD, se existir. */
 function restingMode(): LocalMode {
-  return pending && sendState?.phase === 'retry' ? 'retry' : 'history'
+  if (!pending) return 'history'
+  if (sendState?.phase === 'staged') return 'confirm'
+  return sendState?.phase === 'retry' ? 'retry' : 'history'
 }
 
 function showError(message: string) {
@@ -565,7 +588,11 @@ async function postTurn(turn: PendingTurn): Promise<SendEvent> {
       bitDepth: 16,
       clientMsgId: turn.clientMsgId,
       expectedRevision: turn.expectedRevision,
+      // Transcreva e espere: a fala so vai para a Iris depois do toque.
+      confirm: true,
     })
+    if (accepted.staged) return { kind: 'staged', transcript: accepted.transcript }
+    // Servidor antigo: ignorou o `confirm` e ja entregou. Nao ha o que confirmar.
     return { kind: 'accepted', transcript: accepted.transcript }
   } catch (error) {
     // status 0 e a marca de rede/timeout: nao chegou. Qualquer outro status significa
@@ -600,6 +627,22 @@ async function askTurn(turn: PendingTurn): Promise<SendEvent> {
   if (status.kind === 'unknown') return { kind: 'status-unknown' }
   if (status.kind === 'missing') return { kind: 'status-missing' }
   return { kind: 'status-failed' }
+}
+
+/**
+ * Confirma a entrega da transcricao. A revision vai FRESCA: entre o servidor transcrever e
+ * o John tocar, a conversa pode ter andado por outro canal, e o servidor precisa recusar em
+ * vez de injetar a fala num contexto que ele nao leu.
+ */
+async function commitPending(turn: PendingTurn): Promise<SendEvent> {
+  try {
+    const result = await commitTurn(turn.clientMsgId, revision || turn.expectedRevision)
+    if (result.kind === 'accepted') return { kind: 'accepted', transcript: result.transcript }
+    return { kind: 'status-unknown' }
+  } catch (error) {
+    if (error instanceof ApiError && error.status > 0) return { kind: 'http', status: error.status }
+    return { kind: 'network' }
+  }
 }
 
 async function probeSession(): Promise<SendEvent> {
@@ -642,6 +685,20 @@ function applySendOutcome() {
     // uma falha de envio deixava o app cego para a resposta que estava a caminho.
     schedulePoll()
     if (lastProbe) applySession(lastProbe, true)
+    return
+  }
+
+  if (state.phase === 'staged') {
+    // A transcricao entra no rascunho para o texto sobreviver a fechar e reabrir o app: o
+    // que ele confirma depois e a mesma frase que leu agora, nao um resumo generico.
+    if (pending && state.transcript && pending.transcript !== state.transcript) {
+      pending = { ...pending, transcript: state.transcript }
+      draftOnDisk = savePendingTurn(pending)
+    }
+    thinkingSince = 0
+    mode = 'confirm'
+    setStatus('listening', 'Confirmar envio')
+    renderState()
     return
   }
 
@@ -729,6 +786,10 @@ async function deliverPending() {
         sendState = reduce(sendState, await askTurn(pending))
       } else if (sendState.phase === 'probe') {
         sendState = reduce(sendState, await probeSession())
+      } else if (sendState.phase === 'commit') {
+        mode = 'sending'
+        renderState()
+        sendState = reduce(sendState, await commitPending(pending))
       } else if (sendState.phase === 'wait') {
         mode = 'sending'
         renderState()
@@ -745,6 +806,16 @@ async function deliverPending() {
   }
   // Fora do `delivering` para o showError do desfecho nao cair no proprio guarda.
   if (settled) applySendOutcome()
+}
+
+/** O toque que libera a fala para a Iris. Nao reenvia audio: o servidor ja tem tudo. */
+function confirmNow() {
+  if (!pending || !sendState || sendState.phase !== 'staged') return
+  disarmDiscard()
+  sendState = reduce(sendState, { kind: 'manual' })
+  mode = 'sending'
+  renderState()
+  void deliverPending()
 }
 
 function retryNow() {
@@ -926,6 +997,11 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
         void finishRecording()
         return
       }
+      // Transcricao na tela esperando decisao: o toque e o que entrega a fala.
+      if (mode === 'confirm') {
+        confirmNow()
+        return
+      }
       // Rascunho parado ou esperando o degrau da escada: o toque reenvia agora.
       if (mode === 'retry' || mode === 'sending') {
         retryNow()
@@ -940,7 +1016,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
       void beginRecording()
       return
     case 'scroll_up':
-      if (mode === 'retry') {
+      if (mode === 'retry' || mode === 'confirm') {
         // Descartar e a UNICA acao irreversivel do app, e apaga a unica copia de uma fala
         // que o servidor talvez nunca tenha recebido. Um esbarrao nao pode bastar: o
         // primeiro gesto arma, o segundo confirma, e a janela expira sozinha.

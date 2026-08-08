@@ -62,7 +62,31 @@ async function postTurn(port, body) {
     )
     if (!response.ok) return { kind: 'http', status: response.status }
     const json = await response.json()
+    // 200 + staged = transcrito e retido; 202 = ja entregue (servidor antigo).
+    if (response.status === 200 && json.staged === true) {
+      return { kind: 'staged', transcript: json.transcript }
+    }
     return { kind: 'accepted', transcript: json.transcript }
+  } catch {
+    return { kind: 'network' }
+  }
+}
+
+async function commit(port, clientMsgId, expectedRevision) {
+  try {
+    const response = await fetchWithTimeout(
+      `http://127.0.0.1:${port}/glass/hermes/turn/${clientMsgId}/commit`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expectedRevision }),
+      },
+      TIMEOUT_MS,
+    )
+    if (!response.ok) return { kind: 'http', status: response.status }
+    const json = await response.json()
+    if (response.status === 202) return { kind: 'accepted', transcript: json.transcript }
+    return { kind: 'status-unknown' }
   } catch {
     return { kind: 'network' }
   }
@@ -103,13 +127,16 @@ async function ask(port, clientMsgId) {
 }
 
 /** Roda a entrega inteira sem dormir de verdade: o degrau da escada vira um `timer`. */
-async function deliver(port, draft) {
-  let state = startSend(draft.expectedRevision)
+async function deliver(port, draft, initial = null) {
+  let state = initial ?? startSend(draft.expectedRevision)
   const waits = []
   for (let guard = 0; guard < 32; guard++) {
     if (state.phase === 'post') state = reduce(state, await postTurn(port, draft))
     else if (state.phase === 'ask') state = reduce(state, await ask(port, draft.clientMsgId))
     else if (state.phase === 'probe') state = reduce(state, await probe(port))
+    else if (state.phase === 'commit') {
+      state = reduce(state, await commit(port, draft.clientMsgId, draft.expectedRevision))
+    }
     else if (state.phase === 'wait') {
       waits.push(state.waitMs)
       state = reduce(state, { kind: 'timer' })
@@ -263,4 +290,72 @@ test('422 e o unico caminho que descarta a gravacao', async () => {
     assert.equal(state.reason, 'no-speech')
     assert.equal(state.clearDraft, true)
   })
+})
+
+// A prova que importa da confirmacao, contra o servidor de verdade por socket: entre a
+// transcricao e o toque, a conversa nao pode ter mudado. Se a revision ou a contagem de
+// turnos mexesse aqui, "confirmar antes de enviar" seria propaganda — a fala ja teria ido.
+test('confirmação: a fala só entra na conversa depois do toque', async () => {
+  const port = 8797
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+
+    const staged = await deliver(port, draft)
+    assert.equal(staged.state.phase, 'staged')
+    assert.equal(staged.state.transcript, 'Mensagem de voz simulada')
+    assert.equal(staged.state.clearDraft, false)
+
+    const during = await readSession(port)
+    assert.equal(during.revision, before.revision)
+    assert.equal(during.turns.length, before.turns.length)
+    assert.equal(during.state, 'idle')
+
+    const confirmed = await deliver(
+      port,
+      draft,
+      reduce(staged.state, { kind: 'manual' }),
+    )
+    assert.equal(confirmed.state.phase, 'thinking')
+    assert.equal(confirmed.state.clearDraft, true)
+
+    const after = await readSession(port)
+    assert.equal(after.turns.length, before.turns.length + 1)
+    assert.notEqual(after.revision, before.revision)
+  })
+})
+
+// Confirmar duas vezes (toque duplicado, retry apos rede instavel) nao pode render dois
+// turnos: o servidor guarda o desfecho por clientMsgId.
+test('confirmação repetida entrega um turno só', async () => {
+  const port = 8798
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+    const staged = await deliver(port, draft)
+    assert.equal(staged.state.phase, 'staged')
+
+    await deliver(port, draft, reduce(staged.state, { kind: 'manual' }))
+    const once = await readSession(port)
+    await deliver(port, draft, reduce(staged.state, { kind: 'manual' }))
+    const twice = await readSession(port)
+
+    assert.equal(once.turns.length, before.turns.length + 1)
+    assert.equal(twice.turns.length, once.turns.length)
+  })
+})
+
+// Backend antigo em producao ignora o pedido de confirmacao e ja entrega. O cliente nao
+// pode ficar parado esperando um toque que nao decide mais nada.
+test('contra o backend antigo a confirmação não trava a entrega', async () => {
+  const port = 8799
+  await scenario('none', port, async () => {
+    const before = await readSession(port)
+    const draft = { ...draftFor(before.revision), confirm: true }
+    const result = await deliver(port, draft)
+    assert.equal(result.state.phase, 'thinking')
+    assert.equal(result.state.clearDraft, true)
+    const after = await readSession(port)
+    assert.equal(after.turns.length, before.turns.length + 1)
+  }, true)
 })

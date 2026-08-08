@@ -22,6 +22,15 @@ call, so a failed or hanging submit can no longer take the recording with it.
 - Submit failure keeps the draft and shows the reason. Tap resends (the server
   deduplicates by `clientMsgId` + audio fingerprint, so resending is a no-op if
   the turn already landed); scroll up discards.
+- Nothing reaches the agent without a tap. The audio uploads, the server
+  transcribes and **stops** (`POST /turn` with `confirm`, answered `200
+  {staged:true, transcript}`); the HUD shows what was heard and only
+  `POST /turn/:clientMsgId/commit` — ~200 bytes, no re-upload — hands it over.
+  Confirming before the upload is impossible: the glasses cannot transcribe.
+  The revision is re-checked at commit time, not inherited from the upload, so
+  a conversation that moved on in the meantime is refused rather than injected
+  into. Against a backend without the route the `confirm` field is ignored and
+  the turn goes straight through, exactly as before.
 - Retries never blind-repeat the ~1.3 MB upload. A network failure asks
   `GET /turn/:clientMsgId` — a ~200 byte answer that is definitive: `done`
   replays the outcome the POST would have returned, `pending` keeps asking

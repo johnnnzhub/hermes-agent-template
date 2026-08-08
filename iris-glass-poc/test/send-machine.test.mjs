@@ -391,3 +391,99 @@ test('cada motivo tem uma manchete propria no HUD', () => {
   assert.equal(reasonHeadline('network'), 'NÃO ENVIOU')
   assert.equal(reasonHeadline('exhausted'), 'NÃO ENVIOU')
 })
+
+// --- Confirmacao antes de enviar -------------------------------------------------------
+//
+// A fala vira acao no instante em que chega na Iris, e nao ha desfazer. A janela de
+// confirmacao so pode existir DEPOIS do STT, porque antes dele ninguem sabe o que foi dito.
+
+test('transcricao retida espera o toque e nao apaga o rascunho', () => {
+  const state = reduce(start(), { kind: 'staged', transcript: 'quanto pesa um litro de agua' })
+  assert.equal(state.phase, 'staged')
+  assert.equal(state.transcript, 'quanto pesa um litro de agua')
+  assert.equal(state.clearDraft, false)
+  assert.equal(state.attempts, 1)
+})
+
+// Nada acontece sozinho neste estado: sem timer, sem reenvio, sem descarte. Quem decide
+// e o John — um turno que se enviasse sozinho depois de um tempo nao seria confirmacao.
+test('estado de confirmacao ignora tudo que nao seja o toque', () => {
+  const staged = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  for (const event of [
+    { kind: 'timer' },
+    { kind: 'network' },
+    { kind: 'status-failed' },
+    { kind: 'probe', state: 'idle', revision: ANCHOR },
+    { kind: 'http', status: 500 },
+  ]) {
+    assert.deepEqual(reduce(staged, event), staged, `evento ${event.kind} mexeu no estado`)
+  }
+})
+
+test('o toque entrega a fala sem reenviar audio', () => {
+  let state = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  state = reduce(state, { kind: 'manual' })
+  assert.equal(state.phase, 'commit')
+  // O commit nao conta como POST: o audio ja subiu uma vez.
+  assert.equal(state.attempts, 1)
+
+  state = reduce(state, { kind: 'accepted', transcript: 'oi' })
+  assert.equal(state.phase, 'thinking')
+  assert.equal(state.clearDraft, true)
+})
+
+// Entre transcrever e tocar, a conversa pode ter andado por outro canal. O servidor recusa,
+// e a fala continua guardada — recusar nao pode custar a gravacao.
+test('conflito no commit para com o rascunho intacto', () => {
+  let state = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  state = reduce(state, { kind: 'manual' })
+  state = reduce(state, { kind: 'http', status: 409 })
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.reason, 'conflict')
+  assert.equal(state.needsRefresh, true)
+  assert.equal(state.clearDraft, false)
+})
+
+// Commit que morre na rede nao vira palpite: pergunta por id, e a resposta decide. Aqui a
+// fala TINHA entrado, e insistir as cegas teria mandado a mesma frase duas vezes.
+test('commit perdido na rede descobre a verdade perguntando', () => {
+  let state = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  state = reduce(state, { kind: 'manual' })
+  state = reduce(state, { kind: 'network' })
+  assert.equal(state.phase, 'ask')
+  state = reduce(state, { kind: 'status-done', turnStatus: 202, transcript: 'oi' })
+  assert.equal(state.phase, 'thinking')
+  assert.equal(state.clearDraft, true)
+})
+
+// E se ainda estiver retido, o 200 tem de voltar para a tela de confirmacao. Tratar 200
+// como erro generico pararia com "HERMES FORA DO AR" diante de um servidor que esta apenas
+// esperando a decisao do John.
+test('status 200 por id devolve a tela de confirmacao', () => {
+  let state = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  state = reduce(state, { kind: 'manual' })
+  state = reduce(state, { kind: 'network' })
+  state = reduce(state, { kind: 'status-done', turnStatus: 200, transcript: 'oi de novo' })
+  assert.equal(state.phase, 'staged')
+  assert.equal(state.transcript, 'oi de novo')
+  assert.equal(state.clearDraft, false)
+})
+
+// Servidor que esqueceu o turno (restart, eviccao): o audio ainda esta no rascunho, entao
+// o caminho e subir de novo — e confirmar de novo.
+test('turno esquecido no commit volta para a escada de upload', () => {
+  let state = reduce(start(), { kind: 'staged', transcript: 'oi' })
+  state = reduce(state, { kind: 'manual' })
+  state = reduce(state, { kind: 'status-unknown' })
+  assert.equal(state.phase, 'wait')
+  assert.equal(state.waitNext, 'post')
+  assert.equal(state.clearDraft, false)
+})
+
+// Backend antigo ignora o pedido de confirmacao e entrega direto. O cliente nao pode ficar
+// esperando um toque que nao decide mais nada.
+test('servidor antigo entrega direto e nao mostra confirmacao', () => {
+  const state = reduce(start(), { kind: 'accepted', transcript: 'oi' })
+  assert.equal(state.phase, 'thinking')
+  assert.equal(state.clearDraft, true)
+})
