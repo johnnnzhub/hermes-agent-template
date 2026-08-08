@@ -1,5 +1,8 @@
 const SESSION_TIMEOUT_MS = 12_000
-const TURN_TIMEOUT_MS = 35_000
+// 45 s, nao 35 s: o servidor pode gastar ate 30 s so de STT, mais dois snapshots da
+// sessao e o prompt.submit por RPC. Abortar em 35 s era desistir de um turno que o
+// backend estava prestes a aceitar — e a tentativa seguinte reenviava 1,28 MB a toa.
+const TURN_TIMEOUT_MS = 45_000
 
 export interface HermesTurn {
   id: string
@@ -55,6 +58,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  // Sem AbortController o WebView pode pendurar a requisicao sem nunca rejeitar, e o HUD
+  // ficaria em PENSANDO para sempre. A corrida garante um fim mesmo nesse caso.
+  if (typeof AbortController === 'undefined') {
+    const pending = fetch(url, init)
+    pending.catch(() => {})
+    return Promise.race([
+      pending,
+      new Promise<Response>((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), timeoutMs),
+      ),
+    ])
+  }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -166,42 +181,41 @@ export async function fetchHermesSession(cursor = 0): Promise<HermesSession> {
   throw new ApiError(0, 'Sem conexão com o HERMES.')
 }
 
+// UMA tentativa. A escada de reenvio saiu daqui e virou a maquina de sendMachine.ts, que
+// pergunta ao servidor (GET /session, ~200 bytes) antes de decidir gastar outro upload de
+// ~1,28 MB. Repetir o mesmo clientMsgId e seguro: o servidor deduplica por
+// clientMsgId + fingerprint do audio e devolve o mesmo resultado, nunca um turno a mais.
+// `status === 0` e a marca de falha de rede/timeout — e o que separa "nao chegou" de
+// "chegou e o servidor recusou".
 export async function sendVoiceTurn(request: VoiceTurnRequest): Promise<VoiceTurnAccepted> {
-  const payload = JSON.stringify(request)
-  let lastError: unknown
-  for (const delay of [0, 1_000, 3_000]) {
-    if (delay) await sleep(delay)
-    try {
-      const response = await fetchWithTimeout(
-        `${baseUrl()}/glass/hermes/turn`,
-        {
-          method: 'POST',
-          headers: { ...authHeaders(), 'content-type': 'application/json' },
-          body: payload,
-        },
-        TURN_TIMEOUT_MS,
-      )
-      if (!response.ok) throw await responseError(response)
-      const body = await response.json()
-      if (
-        body?.ok !== true ||
-        typeof body.sessionId !== 'string' ||
-        typeof body.clientMsgId !== 'string' ||
-        typeof body.transcript !== 'string'
-      ) {
-        throw new ApiError(502, 'Resposta inválida do HERMES.')
-      }
-      return {
-        ok: true,
-        sessionId: body.sessionId,
-        clientMsgId: body.clientMsgId,
-        transcript: body.transcript,
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) throw error
-      lastError = error
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl()}/glass/hermes/turn`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      },
+      TURN_TIMEOUT_MS,
+    )
+    if (!response.ok) throw await responseError(response)
+    const body = await response.json()
+    if (
+      body?.ok !== true ||
+      typeof body.sessionId !== 'string' ||
+      typeof body.clientMsgId !== 'string' ||
+      typeof body.transcript !== 'string'
+    ) {
+      throw new ApiError(502, 'Resposta inválida do HERMES.')
     }
+    return {
+      ok: true,
+      sessionId: body.sessionId,
+      clientMsgId: body.clientMsgId,
+      transcript: body.transcript,
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error
+    throw new ApiError(0, 'Não consegui enviar a mensagem.')
   }
-  if (lastError instanceof ApiError) throw lastError
-  throw new ApiError(0, 'Não consegui enviar a mensagem.')
 }

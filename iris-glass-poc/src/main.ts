@@ -18,17 +18,38 @@ import {
   buildConversationPages,
   latestTurnFirstPage,
   mergeOlderTurns,
+  wrapHudText,
   type ConversationPage,
 } from './conversation'
 import {
   AUDIO_SR,
   bytesToB64,
   cleanupMic,
+  drainRecording,
+  isAudible,
   isRecording,
   onAudioChunk,
   startRecording,
   stopRecording,
 } from './voice'
+import {
+  clearPendingTurn,
+  draftSummary,
+  loadPendingTurn,
+  savePendingTurn,
+  type PendingTurn,
+} from './pendingTurn'
+import {
+  MAX_POSTS,
+  parkedDraft,
+  reasonHeadline,
+  reduce,
+  settlePending,
+  startSend,
+  type SendEvent,
+  type SendState,
+} from './sendMachine'
+import { isThinkingStuck, pollDelay, thinkingLabel } from './thinking'
 import { mountUi, setPreview, setStatus } from './ui'
 import { settleRenderAttempt, type RenderOutcome } from './renderState'
 
@@ -39,7 +60,6 @@ const INITIAL_TEXT = IS_DIAG
   ? `HERMES DIAG · v${__APP_VERSION__}`
   : `HERMES · v${__APP_VERSION__}`
 const RECORDING_LIMIT_MS = 30_000
-const POLL_MS = 1_200
 
 const bridge = await waitForEvenAppBridge()
 
@@ -117,7 +137,7 @@ async function renderNow() {
   }
 }
 
-type LocalMode = 'loading' | 'history' | 'recording' | 'sending' | 'error'
+type LocalMode = 'loading' | 'history' | 'recording' | 'sending' | 'retry' | 'error'
 
 let mode: LocalMode = 'loading'
 let revision = ''
@@ -136,12 +156,55 @@ let sending = false
 let loadingOlder = false
 let micStarting = false
 
+// Rascunho + maquina de entrega. `pending` e a fonte da verdade da fala capturada; o
+// localStorage e best-effort e serve para o rascunho sobreviver a fechar o app.
+let pending: PendingTurn | null = null
+let sendState: SendState | null = null
+let sendGen = 0
+let waitTimer: number | null = null
+let delivering = false
+let lastProbe: HermesSession | null = null
+// Inicio do periodo ocupado, para o contador e para o teto do PENSANDO.
+let busySince = 0
+// O que o servidor entendeu da fala, devolvido pelo 202.
+let echo = ''
+
+function busyElapsed(): number {
+  return busySince ? Date.now() - busySince : 0
+}
+
 function workingContent(): string {
+  const elapsed = busyElapsed()
+  if (isThinkingStuck(elapsed)) return 'SEM RESPOSTA\nTOQUE PARA ATUALIZAR'
   if (remoteState === 'awaiting' || progress?.kind === 'awaiting') {
     return 'AGUARDANDO NO TERMINAL'
   }
-  if (progress?.kind === 'tool') return progress.text.toUpperCase()
-  return 'PENSANDO'
+  const base = progress?.kind === 'tool' ? progress.text.toUpperCase() : 'PENSANDO'
+  const label = thinkingLabel(base, elapsed)
+  // Eco do que o servidor entendeu: o transcript volta no 202 e ate a v0.4.3 era jogado
+  // fora, entao a fala sumia da tela no instante em que era aceita.
+  if (!echo) return label
+  return [label, ...wrapHudText(`» ${echo}`).slice(0, 3)].join('\n')
+}
+
+function sendingContent(): string {
+  if (sendState?.phase === 'wait') {
+    return [
+      `SEM REDE · TENTATIVA ${Math.min(sendState.attempts + 1, MAX_POSTS)} DE ${MAX_POSTS}`,
+      'TOQUE = TENTAR AGORA',
+    ].join('\n')
+  }
+  return 'ENVIANDO'
+}
+
+function retryContent(): string {
+  if (!sendState || !pending) return emptyContent()
+  return [
+    reasonHeadline(sendState.reason),
+    ...wrapHudText(`» ${draftSummary(pending)}`).slice(0, 3),
+    'TOQUE = REENVIAR',
+    'ROLAR PRA CIMA = DESCARTAR',
+  ].join('\n')
 }
 
 function emptyContent(): string {
@@ -151,7 +214,8 @@ function emptyContent(): string {
 function contentForState(): string {
   if (mode === 'loading') return INITIAL_TEXT
   if (mode === 'recording') return 'OUVINDO'
-  if (mode === 'sending') return 'PENSANDO'
+  if (mode === 'sending') return sendingContent()
+  if (mode === 'retry') return retryContent()
   if (mode === 'error') return notice || 'NÃO FOI POSSÍVEL CONTINUAR'
   if (remoteState !== 'idle') return workingContent()
   if (!pages.length) return emptyContent()
@@ -171,7 +235,18 @@ function clearNoticeTimer() {
   }
 }
 
+/** Estado de repouso: o rascunho pendente manda no HUD, se existir. */
+function restingMode(): LocalMode {
+  return pending && sendState?.phase === 'retry' ? 'retry' : 'history'
+}
+
 function showError(message: string) {
+  // Entrega em curso manda no HUD: um erro de poll concorrente nao pode roubar a tela
+  // de quem esta tentando salvar a fala do John.
+  if (delivering) {
+    setStatus('error', message)
+    return
+  }
   clearNoticeTimer()
   mode = 'error'
   notice = message
@@ -180,14 +255,37 @@ function showError(message: string) {
   noticeTimer = window.setTimeout(() => {
     noticeTimer = null
     if (mode !== 'error' || hudDead) return
-    mode = 'history'
+    // Erro com rascunho nao vira historico: volta para a tela que oferece o reenvio.
+    mode = restingMode()
     notice = ''
     renderState()
   }, 3_000)
 }
 
+/**
+ * Pos-condicao do envio ambiguo. Quando o POST morreu e o probe so viu a sessao mexida,
+ * quem decide se a fala entrou e a sessao de volta em idle. Nada de apagar rascunho por
+ * palpite. (A fase 2 troca isto por GET /glass/hermes/turn/:clientMsgId, que responde
+ * direto em vez de inferir.)
+ */
+function reconcilePending(snapshot: HermesSession) {
+  if (!pending || sendState?.phase !== 'thinking') return
+  const verdict = settlePending(pending, {
+    state: snapshot.state,
+    revision: snapshot.revision,
+    turnCount: snapshot.turns.length,
+  })
+  if (verdict === 'pending') return
+  if (verdict === 'delivered') {
+    dropDraft()
+    return
+  }
+  sendState = { ...parkedDraft(pending.expectedRevision), reason: 'network' }
+}
+
 function applySession(snapshot: HermesSession, focusLatest: boolean) {
   revision = snapshot.revision
+  const wasIdle = remoteState === 'idle'
   remoteState = snapshot.state
   progress = snapshot.progress
   turns = snapshot.turns
@@ -195,7 +293,19 @@ function applySession(snapshot: HermesSession, focusLatest: boolean) {
   pages = buildConversationPages(turns)
   if (focusLatest) pageIndex = latestTurnFirstPage(pages)
   else pageIndex = Math.min(pageIndex, Math.max(0, pages.length - 1))
-  mode = 'history'
+
+  if (snapshot.state === 'idle') {
+    busySince = 0
+    echo = ''
+  } else if (wasIdle || !busySince) {
+    busySince = Date.now()
+  }
+
+  reconcilePending(snapshot)
+
+  // Gravacao e entrega mandam no HUD enquanto acontecem; um refresh concorrente
+  // (foreground enter, poll) nao pode roubar a tela delas.
+  if (mode !== 'sending' && mode !== 'recording') mode = restingMode()
   setStatus(remoteState === 'idle' ? 'listening' : 'connecting', progress?.text || remoteState)
   renderState()
 }
@@ -223,12 +333,14 @@ function clearPoll() {
 
 function schedulePoll() {
   if (pollTimer !== null || hudDead) return
+  // 1,2 s so nos primeiros 30 s. Um turno longo nao merece 3.000 requisicoes por hora
+  // num link que atravessa oculos, celular e tailnet.
   pollTimer = window.setTimeout(async () => {
     pollTimer = null
     if (hudDead) return
     await refreshSession(true)
     if (remoteState !== 'idle') schedulePoll()
-  }, POLL_MS)
+  }, pollDelay(busyElapsed()))
 }
 
 async function loadOlder() {
@@ -252,7 +364,9 @@ async function loadOlder() {
 }
 
 async function beginRecording() {
-  if (mode === 'recording' || sending || micStarting || hudDead) return
+  if (mode === 'recording' || mode === 'sending' || sending || micStarting || hudDead) return
+  // Gravar por cima de um rascunho pendente destruiria a fala que ainda nao foi entregue.
+  if (pending) return
   if (remoteState !== 'idle') {
     showError('A Iris já está trabalhando.')
     return
@@ -289,41 +403,220 @@ function clearRecordingTimer() {
   }
 }
 
+function clearWaitTimer() {
+  if (waitTimer !== null) {
+    window.clearTimeout(waitTimer)
+    waitTimer = null
+  }
+}
+
+function dropDraft() {
+  pending = null
+  sendState = null
+  clearWaitTimer()
+  // Invalida qualquer continuacao de entrega ainda em voo.
+  sendGen++
+  clearPendingTurn()
+}
+
+function adoptDraft(pcm: Uint8Array, durMs: number): PendingTurn {
+  const turn: PendingTurn = {
+    clientMsgId: newMsgId(),
+    pcmB64: bytesToB64(pcm),
+    expectedRevision: revision,
+    createdAt: Date.now(),
+    durMs,
+    attempts: 0,
+    submitted: false,
+    turnsAtSubmit: turns.length,
+  }
+  savePendingTurn(turn)
+  return turn
+}
+
+async function postTurn(turn: PendingTurn): Promise<SendEvent> {
+  try {
+    const accepted = await sendVoiceTurn({
+      pcmB64: turn.pcmB64,
+      sampleRate: AUDIO_SR,
+      channels: 1,
+      bitDepth: 16,
+      clientMsgId: turn.clientMsgId,
+      expectedRevision: turn.expectedRevision,
+    })
+    return { kind: 'accepted', transcript: accepted.transcript }
+  } catch (error) {
+    // status 0 e a marca de rede/timeout: nao chegou. Qualquer outro status significa
+    // que o servidor respondeu, e a resposta dele decide o caminho.
+    if (error instanceof ApiError && error.status > 0) return { kind: 'http', status: error.status }
+    return { kind: 'network' }
+  }
+}
+
+async function probeSession(): Promise<SendEvent> {
+  try {
+    const snapshot = await fetchHermesSession()
+    lastProbe = snapshot
+    return { kind: 'probe', state: snapshot.state, revision: snapshot.revision }
+  } catch {
+    return { kind: 'probe-failed' }
+  }
+}
+
+function armWait(ms: number, gen: number) {
+  clearWaitTimer()
+  waitTimer = window.setTimeout(() => {
+    waitTimer = null
+    if (gen !== sendGen || hudDead || !sendState) return
+    sendState = reduce(sendState, { kind: 'timer' })
+    void deliverPending()
+  }, ms)
+}
+
+function applySendOutcome() {
+  const state = sendState
+  if (!state) return
+
+  if (state.phase === 'thinking') {
+    echo = state.transcript || echo
+    if (state.clearDraft) dropDraft()
+    remoteState = 'busy'
+    progress = { kind: 'thinking', text: 'Pensando' }
+    if (!busySince) busySince = Date.now()
+    mode = 'history'
+    setStatus('connecting', 'Executando')
+    renderState()
+    // Fora de qualquer try: ate a v0.4.3 o poll so era armado no caminho feliz, entao
+    // uma falha de envio deixava o app cego para a resposta que estava a caminho.
+    schedulePoll()
+    if (lastProbe) applySession(lastProbe, true)
+    return
+  }
+
+  if (state.phase === 'discarded') {
+    const reason = state.reason
+    dropDraft()
+    mode = restingMode()
+    showError(reasonHeadline(reason))
+    return
+  }
+
+  if (state.phase === 'retry') {
+    mode = 'retry'
+    setStatus('error', reasonHeadline(state.reason))
+    renderState()
+    // Conflito exige revision fresca antes do proximo toque.
+    if (state.needsRefresh) void refreshSession(true)
+  }
+}
+
+async function deliverPending() {
+  if (!pending || !sendState || delivering || hudDead) return
+  delivering = true
+  const gen = ++sendGen
+  lastProbe = null
+  let settled = false
+  try {
+    while (!hudDead && gen === sendGen && pending && sendState) {
+      if (sendState.phase === 'post') {
+        mode = 'sending'
+        renderState()
+        sendState = reduce(sendState, await postTurn(pending))
+      } else if (sendState.phase === 'probe') {
+        sendState = reduce(sendState, await probeSession())
+      } else if (sendState.phase === 'wait') {
+        mode = 'sending'
+        renderState()
+        // A espera sai do fluxo: um toque durante ela precisa poder encurtar o degrau.
+        armWait(sendState.waitMs, gen)
+        return
+      } else {
+        break
+      }
+    }
+    settled = gen === sendGen
+  } finally {
+    delivering = false
+  }
+  // Fora do `delivering` para o showError do desfecho nao cair no proprio guarda.
+  if (settled) applySendOutcome()
+}
+
+function retryNow() {
+  if (!pending || !sendState) return
+  if (sendState.phase !== 'retry' && sendState.phase !== 'wait') return
+  clearWaitTimer()
+  sendGen++
+  let next = reduce(sendState, { kind: 'manual' })
+  if (next.needsRefresh) {
+    // A conversa mudou, entao este e um turno genuinamente novo: mexer na revision muda
+    // o fingerprint do audio e o servidor devolveria 409 "clientMsgId ja foi utilizado".
+    pending = {
+      ...pending,
+      clientMsgId: newMsgId(),
+      expectedRevision: revision,
+      turnsAtSubmit: turns.length,
+      attempts: 0,
+    }
+    savePendingTurn(pending)
+    next = startSend(revision)
+  }
+  sendState = next
+  mode = 'sending'
+  renderState()
+  void deliverPending()
+}
+
+function discardDraft() {
+  if (!pending) return
+  dropDraft()
+  echo = ''
+  notice = ''
+  mode = 'history'
+  setStatus('listening', 'Pronto')
+  renderState()
+}
+
+function restoreDraft() {
+  if (pending || hudDead) return
+  const saved = loadPendingTurn()
+  if (!saved) return
+  // Rascunho de uma sessao anterior nao sai sozinho: reenviar uma fala de minutos atras
+  // sem aviso seria surpresa. Fica oferecido ate o toque.
+  pending = saved
+  sendState = parkedDraft(saved.expectedRevision)
+  mode = 'retry'
+  renderState()
+}
+
 async function finishRecording() {
   if (sending || !isRecording() || hudDead) return
   sending = true
   clearRecordingTimer()
   mode = 'sending'
   renderState()
+  let captured = false
   try {
-    const { pcm } = await stopRecording(bridge, false)
+    const { pcm, durMs } = await stopRecording(bridge, false)
     if (!pcm) {
+      mode = restingMode()
       showError('Não ouvi fala suficiente.')
-      return
+    } else {
+      // PRE-CONDICAO do envio: a fala vira artefato duravel antes da primeira chamada de
+      // rede. Ate a v0.4.3 o PCM so existia neste escopo — qualquer falha o levava junto,
+      // sem rastro no plugin nem no servidor.
+      pending = adoptDraft(pcm, durMs)
+      sendState = startSend(pending.expectedRevision)
+      echo = ''
+      captured = true
     }
-    const clientMsgId = newMsgId()
-    await sendVoiceTurn({
-      pcmB64: bytesToB64(pcm),
-      sampleRate: AUDIO_SR,
-      channels: 1,
-      bitDepth: 16,
-      clientMsgId,
-      expectedRevision: revision,
-    })
-    remoteState = 'busy'
-    progress = { kind: 'thinking', text: 'Pensando' }
-    mode = 'history'
-    setStatus('connecting', 'Executando')
-    renderState()
-    schedulePoll()
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 409) {
-      await refreshSession()
-    }
-    showError(error instanceof ApiError ? error.publicMessage : 'Não consegui enviar a mensagem.')
+  } catch {
+    mode = restingMode()
+    showError('Não consegui guardar a gravação.')
   } finally {
     sending = false
   }
+  if (captured) await deliverPending()
 }
 
 function navigate(delta: -1 | 1) {
@@ -345,6 +638,7 @@ async function cleanup() {
   clearPoll()
   clearRecordingTimer()
   clearNoticeTimer()
+  clearWaitTimer()
   if (renderTimer !== null) {
     window.clearTimeout(renderTimer)
     renderTimer = null
@@ -387,10 +681,27 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
 
   switch (action) {
     case 'click':
-      if (mode === 'recording') void finishRecording()
-      else void beginRecording()
+      if (mode === 'recording') {
+        void finishRecording()
+        return
+      }
+      // Rascunho parado ou esperando o degrau da escada: o toque reenvia agora.
+      if (mode === 'retry' || mode === 'sending') {
+        retryNow()
+        return
+      }
+      // Passou do teto do PENSANDO: o toque busca a verdade em vez de gravar por cima.
+      if (remoteState !== 'idle' && isThinkingStuck(busyElapsed())) {
+        void refreshSession(true)
+        return
+      }
+      void beginRecording()
       return
     case 'scroll_up':
+      if (mode === 'retry') {
+        discardDraft()
+        return
+      }
       navigate(-1)
       return
     case 'scroll_down':
@@ -408,14 +719,21 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
     case 'lifecycle':
       if (isForegroundExit(event)) {
         clearRecordingTimer()
+        // Ate a v0.4.3 este caminho chamava cleanupMic direto, que zerava o buffer: sair
+        // do app no meio de uma frase destruia a fala em silencio. Agora drena primeiro.
+        const captured = isRecording() ? drainRecording() : null
         void cleanupMic(bridge).then(() => {
-          if (mode === 'recording') {
-            mode = 'history'
-            renderState()
+          if (captured && isAudible(captured.pcm, captured.durMs) && !pending) {
+            pending = adoptDraft(captured.pcm, captured.durMs)
+            sendState = parkedDraft(pending.expectedRevision)
+            mode = 'retry'
+          } else if (mode === 'recording') {
+            mode = restingMode()
           }
+          renderState()
         })
       }
-      if (isForegroundEnter(event)) void refreshSession(true)
+      if (isForegroundEnter(event)) void refreshSession(true).then(restoreDraft)
       return
     default:
       if (IS_DIAG) {
@@ -435,4 +753,4 @@ if (IS_DIAG) {
 }
 
 window.addEventListener('beforeunload', () => void cleanup())
-void refreshSession(true)
+void refreshSession(true).then(restoreDraft)

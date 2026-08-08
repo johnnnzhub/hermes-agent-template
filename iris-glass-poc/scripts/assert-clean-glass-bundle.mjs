@@ -33,6 +33,14 @@ const REQUIRED = [
   '/glass/hermes/turn',
   'hermes-g2.tail390702.ts.net:8443',
   'AGUARDANDO NO TERMINAL',
+  // Contrato da v0.5.0: a fala capturada tem tela propria e saida por toque. Sem estas
+  // strings o bundle voltou a ser o que perdia a gravacao em silencio.
+  'ENVIANDO',
+  'RASCUNHO GUARDADO',
+  'NÃO ENVIOU',
+  'TOQUE = REENVIAR',
+  'ROLAR PRA CIMA = DESCARTAR',
+  'SEM RESPOSTA',
 ]
 
 const envKeys = ['VITE_GLASS_DIAG', 'VITE_HERMES_API_BASE']

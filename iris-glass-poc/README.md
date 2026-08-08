@@ -14,6 +14,26 @@ second agent, model profile, memory, or conversation.
 - Close while busy: Hermes continues; reopening shows current progress or the
   completed answer.
 
+### Recorded speech is never dropped
+
+Since 0.5.0 the captured PCM becomes a durable draft *before* the first network
+call, so a failed or hanging submit can no longer take the recording with it.
+
+- Submit failure keeps the draft and shows the reason. Tap resends (the server
+  deduplicates by `clientMsgId` + audio fingerprint, so resending is a no-op if
+  the turn already landed); scroll up discards.
+- Retries never blind-repeat the ~1.3 MB upload: a network failure first asks
+  `GET /session` whether the turn actually landed, and only re-posts when the
+  conversation is provably untouched. Automatic ladder: 5 s, 15 s, 40 s.
+- Leaving the app mid-sentence drains the buffer into a draft instead of wiping
+  it. The draft survives a restart for 15 minutes and is offered, never
+  auto-sent.
+- `PENSANDO` shows elapsed time past 20 s and, after 4 minutes without an
+  answer, offers a refresh instead of waiting forever. Polling backs off from
+  1.2 s to 3 s to 8 s.
+- Only "no speech" (422), "audio too long" (413), and a rejected payload (400)
+  discard the recording — nothing else does.
+
 The display exposes conversation text plus safe progress (`Pensando`,
 `Usando <ferramenta>`, or `Aguardando no Terminal Mode`). Tool arguments,
 outputs, logs, secrets, questions, and approval details are never returned by
@@ -52,6 +72,11 @@ VITE_HERMES_API_BASE=http://127.0.0.1:8797 \
 VITE_GLASS_API_TOKEN=dev-token npm run dev
 ```
 
+The mock injects failures so the loss paths are reproducible without hardware:
+`HERMES_MOCK_FAIL=hang|flaky|409|422|413|500` at startup, or
+`curl "http://127.0.0.1:8797/mock/fail?mode=hang"` at runtime. `hang` accepts
+the POST and never answers — the exact shape of the reported bug.
+
 The real glasses path still requires the Even Hub companion app and a phone on
 the same tailnet. Build/tests do not count as microphone, gesture, rendering,
 or reconnect validation on physical G2 hardware.
@@ -62,6 +87,9 @@ or reconnect validation on physical G2 hardware.
 |---|---|
 | `src/main.ts` | G2 lifecycle, gestures, serialized full-container renders, polling, and voice flow. |
 | `src/glassApi.ts` | Scoped authenticated API client with stable retry IDs and timeouts. |
+| `src/pendingTurn.ts` | Durable draft of the captured speech; versioned, TTL'd, quota-safe. |
+| `src/sendMachine.ts` | Pure delivery state machine: probe before re-upload, ladder, post-condition. |
+| `src/thinking.ts` | Poll backoff and the honest `PENSANDO` counter/ceiling. |
 | `src/conversation.ts` | Pure history wrapping, pagination, and merge logic. |
 | `src/voice.ts` | Proven PCM normalization, RMS silence gate, mic timeout, and cleanup. |
 | `src/glassEvents.ts` | Firmware event normalization and duplicate-safe gesture classification. |
