@@ -47,6 +47,7 @@ import {
 import {
   MAX_POSTS,
   parkedDraft,
+  parkExhausted,
   reasonHeadline,
   reduce,
   settlePending,
@@ -54,7 +55,7 @@ import {
   type SendEvent,
   type SendState,
 } from './sendMachine'
-import { isThinkingStuck, pollDelay, thinkingLabel } from './thinking'
+import { isThinkingStuck, pollDelay, THINKING_HARD_MS, thinkingLabel } from './thinking'
 import { mountUi, setPreview, setStatus } from './ui'
 import { settleRenderAttempt, type RenderOutcome } from './renderState'
 
@@ -172,6 +173,10 @@ let resolving = false
 let lastProbe: HermesSession | null = null
 // Inicio do periodo ocupado, para o contador e para o teto do PENSANDO.
 let busySince = 0
+// Quando o rascunho entrou em `thinking`. Separado de `busySince`, que zera assim que a
+// sessao volta a idle: um rascunho sem desfecho com a sessao ociosa ficaria sem nenhum
+// relogio e o PENSANDO nao teria fim.
+let thinkingSince = 0
 // O servidor conta ha quanto tempo o turno esta aberto; o teto local so vale como
 // fallback para backends que ainda nao reportam `stuck`.
 let remoteStuck = false
@@ -231,7 +236,9 @@ function contentForState(): string {
   if (mode === 'sending') return sendingContent()
   if (mode === 'retry') return retryContent()
   if (mode === 'error') return notice || 'NÃO FOI POSSÍVEL CONTINUAR'
-  if (remoteState !== 'idle') return workingContent()
+  // Rascunho sem desfecho com a sessao ja em idle continua sendo espera: mostrar o
+  // historico como se nada estivesse pendente escondia a fala em limbo.
+  if (remoteState !== 'idle' || draftAwaitingOutcome()) return workingContent()
   if (!pages.length) return emptyContent()
   return pages[Math.min(pageIndex, pages.length - 1)].text
 }
@@ -285,11 +292,21 @@ function showError(message: string) {
 function reconcilePending(snapshot: HermesSession) {
   if (!pending || sendState?.phase !== 'thinking') return
 
-  // A rota por id ja respondeu nesta entrega: o desfecho e obtivel, entao pergunta em vez
-  // de inferir. Inferir aqui creditaria a este audio qualquer mudanca de revision feita
-  // por OUTRO turno — e apagaria uma fala que o servidor talvez tenha rejeitado.
-  if (sendState.trusted) {
-    if (snapshot.state === 'idle') void resolvePendingById()
+  // Enquanto nao houver PROVA de que a rota por id sumiu (404), o desfecho e obtivel:
+  // pergunta em vez de inferir. Inferir aqui creditaria a este audio qualquer mudanca de
+  // revision feita por OUTRO turno — e apagaria uma fala que o servidor talvez tenha
+  // rejeitado com 409 ou 422.
+  if (!sendState.inferable) {
+    if (snapshot.state !== 'idle') return
+    // Teto do PENSANDO tambem para o rascunho sem desfecho: com a sessao ociosa e o
+    // servidor sem responder sobre este id, devolver o rascunho e mais honesto que
+    // prometer resposta para sempre. Reenviar depois e deduplicado, entao nada se perde.
+    if (thinkingSince && Date.now() - thinkingSince > THINKING_HARD_MS) {
+      sendState = parkExhausted(sendState)
+      thinkingSince = 0
+      return
+    }
+    void resolvePendingById()
     return
   }
 
@@ -345,7 +362,7 @@ async function refreshSession(focusLatest = true) {
   try {
     const snapshot = await fetchHermesSession()
     applySession(snapshot, focusLatest)
-    if (snapshot.state !== 'idle') schedulePoll()
+    if (snapshot.state !== 'idle' || draftAwaitingOutcome()) schedulePoll()
   } catch (error) {
     showError(error instanceof ApiError ? error.publicMessage : 'Sem conexão com o HERMES.')
   } finally {
@@ -360,6 +377,22 @@ function clearPoll() {
   }
 }
 
+/**
+ * Rascunho que o servidor talvez tenha, ainda sem desfecho. O poll nao pode parar aqui:
+ * so ele volta a perguntar pelo id. Sem esta condicao, uma resposta inconclusiva com a
+ * sessao ja em idle deixava o app mudo — sem poll, sem timer, sem HUD de rascunho, e com
+ * `beginRecording` recusando gravar por causa do proprio pendente.
+ */
+function draftAwaitingOutcome(): boolean {
+  return Boolean(pending && sendState?.phase === 'thinking')
+}
+
+/** Relogio da cadencia: o do turno ocupado ou, na falta dele, o do rascunho sem desfecho. */
+function pollElapsed(): number {
+  const draft = thinkingSince ? Date.now() - thinkingSince : 0
+  return Math.max(busyElapsed(), draft)
+}
+
 function schedulePoll() {
   if (pollTimer !== null || hudDead) return
   // 1,2 s so nos primeiros 30 s. Um turno longo nao merece 3.000 requisicoes por hora
@@ -368,8 +401,8 @@ function schedulePoll() {
     pollTimer = null
     if (hudDead) return
     await refreshSession(true)
-    if (remoteState !== 'idle') schedulePoll()
-  }, pollDelay(busyElapsed()))
+    if (remoteState !== 'idle' || draftAwaitingOutcome()) schedulePoll()
+  }, pollDelay(pollElapsed()))
 }
 
 async function loadOlder() {
@@ -442,6 +475,7 @@ function clearWaitTimer() {
 function dropDraft() {
   pending = null
   sendState = null
+  thinkingSince = 0
   clearWaitTimer()
   // Invalida qualquer continuacao de entrega ainda em voo.
   sendGen++
@@ -536,6 +570,9 @@ function applySendOutcome() {
   if (state.phase === 'thinking') {
     echo = state.transcript || echo
     if (state.clearDraft) dropDraft()
+    // Rascunho que segue guardado: liga o relogio proprio dele. E o unico que continua
+    // andando depois que a sessao volta a idle.
+    if (pending && !thinkingSince) thinkingSince = Date.now()
     remoteState = 'busy'
     progress = { kind: 'thinking', text: 'Pensando' }
     if (!busySince) busySince = Date.now()
@@ -549,6 +586,14 @@ function applySendOutcome() {
     return
   }
 
+  if (state.phase === 'wait') {
+    // Este caminho so aparece quando quem reduziu foi o resolvedor por id, fora do laco de
+    // entrega — que arma a propria espera e retorna antes de chegar aqui. Sem armar o timer
+    // agora, a espera nao terminaria nunca e o rascunho ficaria sem ninguem para busca-lo.
+    armWait(state.waitMs, sendGen)
+    return
+  }
+
   if (state.phase === 'discarded') {
     const reason = state.reason
     dropDraft()
@@ -558,6 +603,7 @@ function applySendOutcome() {
   }
 
   if (state.phase === 'retry') {
+    thinkingSince = 0
     mode = 'retry'
     setStatus('error', reasonHeadline(state.reason))
     renderState()
@@ -574,16 +620,29 @@ async function resolvePendingById() {
   if (!pending || !sendState || resolving || delivering || hudDead) return
   resolving = true
   const gen = sendGen
+  let event: SendEvent
   try {
-    const event = await askTurn(pending)
-    if (gen !== sendGen || !pending || !sendState) return
-    // Ainda sem desfecho: a proxima volta para idle tenta de novo.
-    if (event.kind === 'status-pending' || event.kind === 'status-failed') return
-    if (event.kind === 'status-missing') return
-    sendState = reduce({ ...sendState, phase: 'ask' }, event)
+    event = await askTurn(pending)
   } finally {
     resolving = false
   }
+  if (gen !== sendGen || !pending || !sendState || hudDead) return
+
+  // Ainda trabalhando neste id: segue em PENSANDO e a proxima volta do poll pergunta de
+  // novo. O poll continua agendado por draftAwaitingOutcome().
+  if (event.kind === 'status-pending') return
+
+  // 404 na rota por id: servidor sem ela. So a partir daqui a inferencia por revision
+  // volta a ser legitima, e quem a aplica e o reconcilePending da proxima volta.
+  if (event.kind === 'status-missing') {
+    sendState = { ...sendState, inferable: true }
+    return
+  }
+
+  // Todo o resto passa pela maquina, para que 202, 409, 422, "nunca vi" e "nao respondeu"
+  // tenham exatamente o mesmo tratamento do laco de entrega — inclusive a escada, que
+  // termina parando com o rascunho guardado em vez de perguntar para sempre.
+  sendState = reduce({ ...sendState, phase: 'ask' }, event)
   applySendOutcome()
 }
 

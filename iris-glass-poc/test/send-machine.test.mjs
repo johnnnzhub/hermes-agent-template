@@ -112,9 +112,9 @@ test('rota de status ausente cai no caminho antigo em vez de falhar', () => {
 
 // A inferencia por revision e o UNICO caminho do cliente capaz de apagar uma fala que
 // nunca foi entregue (outro turno muda a revision e ela e creditada a esta gravacao).
-// Por isso ela e reservada ao servidor que comprovadamente nao tem a rota — uma pergunta
-// que so falhou insiste, e nunca degrada para palpite.
-test('pergunta que falha insiste, e so cai no palpite depois de esgotar', () => {
+// Insistencia esgotada NAO e evidencia de nada: nao diz que a rota sumiu nem que o turno
+// entrou. Por isso a pergunta que so falha termina PARANDO, nunca em palpite.
+test('pergunta que falha insiste e para, sem nunca cair no palpite', () => {
   let state = reduce(start(), { kind: 'network' })
   const waits = []
   for (let ask = 0; ask <= MAX_ASKS; ask++) {
@@ -126,9 +126,27 @@ test('pergunta que falha insiste, e so cai no palpite depois de esgotar', () => 
     }
   }
   assert.deepEqual(waits, ASK_DELAYS)
-  assert.equal(state.phase, 'probe')
+  assert.equal(state.phase, 'retry')
+  assert.equal(state.reason, 'exhausted')
+  assert.equal(state.clearDraft, false)
+  // A porta da inferencia continua fechada: rede ruim nao vira prova de rota ausente.
+  assert.equal(state.inferable, false)
   // E nunca gastou outro upload no caminho.
   assert.equal(state.attempts, 1)
+})
+
+// Reproducao exata do buraco que sobreviveu a quatro rodadas: POST cai, todas as perguntas
+// falham, outro turno mexe na conversa. Antes, a maquina chegava em `thinking` com a
+// inferencia liberada e a fala do John era creditada ao turno alheio e apagada.
+test('rede ruim nao autoriza creditar a entrega a outro turno', () => {
+  let state = reduce(start(), { kind: 'network' })
+  for (let failure = 0; failure <= MAX_ASKS; failure++) {
+    state = reduce(state, { kind: 'status-failed' })
+    if (state.phase === 'wait') state = reduce(state, { kind: 'timer' })
+  }
+  assert.notEqual(state.phase, 'probe')
+  assert.notEqual(state.phase, 'thinking')
+  assert.equal(state.inferable, false)
 })
 
 // Com a rota respondendo, a inferencia por revision NUNCA entra: um desfecho definitivo
@@ -136,7 +154,7 @@ test('pergunta que falha insiste, e so cai no palpite depois de esgotar', () => 
 test('servidor que ja respondeu nunca degrada para inferencia', () => {
   let state = reduce(start(), { kind: 'network' })
   state = reduce(state, { kind: 'status-pending' })
-  assert.equal(state.trusted, true)
+  assert.equal(state.inferable, false)
   state = reduce(state, { kind: 'timer' })
 
   for (let failure = 0; failure <= MAX_ASKS; failure++) {
@@ -146,6 +164,19 @@ test('servidor que ja respondeu nunca degrada para inferencia', () => {
   assert.notEqual(state.phase, 'probe')
   assert.equal(state.phase, 'retry')
   assert.equal(state.clearDraft, false)
+})
+
+// `inferable` e fato do servidor (404 na rota por id), nao estado da tentativa. Reabrir a
+// escada com um toque nao faz o 404 desaparecer — e zerar a flag ali reabria a inferencia
+// por um caminho ja fechado.
+test('rota ausente continua ausente depois do toque', () => {
+  let state = reduce(start(), { kind: 'network' })
+  state = reduce(state, { kind: 'status-missing' })
+  assert.equal(state.phase, 'probe')
+  assert.equal(state.inferable, true)
+  state = reduce({ ...state, phase: 'retry' }, { kind: 'manual' })
+  assert.equal(state.phase, 'post')
+  assert.equal(state.inferable, true)
 })
 
 // Contadores compartilhados faziam uma resposta de um tipo consumir a escada do outro.

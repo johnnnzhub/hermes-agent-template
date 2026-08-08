@@ -51,11 +51,16 @@ export interface SendState {
    *  compartilhar um so fazia uma alternancia pending/failed pular a escada de ambos. */
   askFailures: number
   /**
-   * O servidor ja respondeu a rota por id alguma vez. A partir daqui a entrega tem
-   * resposta definitiva disponivel, entao inferir pela sessao — o unico caminho capaz de
-   * apagar uma fala nao entregue — deixa de ser aceitavel.
+   * O servidor PROVOU nao ter a rota por id: respondeu 404 nela. Essa e a unica evidencia
+   * que autoriza inferir a entrega pela revision da sessao — o unico caminho do cliente
+   * capaz de apagar uma fala nao entregue.
+   *
+   * Nao confundir com "a pergunta falhou". Timeout, 5xx e queda de rede nao dizem nada
+   * sobre a existencia da rota, entao esgotar tentativas NUNCA liga esta flag: um servidor
+   * atualizado com rede ruim ficaria indistinguivel de um servidor velho, e a fala seria
+   * creditada a uma mudanca de revision causada por outro turno.
    */
-  trusted: boolean
+  inferable: boolean
   waitMs: number
   /** Para onde o `wait` volta quando o tempo passa. */
   waitNext: 'post' | 'ask'
@@ -101,7 +106,7 @@ const BASE: SendState = {
   attempts: 0,
   asks: 0,
   askFailures: 0,
-  trusted: false,
+  inferable: false,
   waitMs: 0,
   waitNext: 'post',
   reason: 'none',
@@ -126,6 +131,15 @@ export function parkedDraft(anchorRevision: string): SendState {
 
 function park(state: SendState, reason: SendReason, needsRefresh = false): SendState {
   return { ...state, phase: 'retry', waitMs: 0, reason, needsRefresh }
+}
+
+/**
+ * Desiste de descobrir o desfecho e devolve o rascunho ao John. Parar e sempre seguro:
+ * o reenvio repete o mesmo clientMsgId, que o servidor deduplica. E preferivel a um
+ * PENSANDO sem fim, que foi o sintoma que abriu esta frente.
+ */
+export function parkExhausted(state: SendState): SendState {
+  return park(state, 'exhausted')
 }
 
 function discard(state: SendState, reason: SendReason): SendState {
@@ -156,18 +170,17 @@ function afterInconclusiveProbe(state: SendState): SendState {
 }
 
 /**
- * A pergunta em si falhou. Insiste — e so depois de esgotar cai para a inferencia por
- * revision, que e o unico caminho do cliente capaz de apagar uma fala nao entregue.
+ * A pergunta em si falhou. Insiste — e ao esgotar PARA, com o rascunho guardado.
+ *
+ * Insistencia esgotada nao e evidencia de nada: nao diz que a rota sumiu nem que o turno
+ * entrou. Cair na inferencia por revision aqui era o buraco que sobreviveu a quatro
+ * rodadas — bastava a rede falhar cinco vezes e outro turno mexer na conversa para o
+ * cliente creditar a entrega e apagar a fala. Parar e sempre seguro: o reenvio manual e
+ * deduplicado por clientMsgId + fingerprint, entao no pior caso o John toca de novo.
  */
 function afterFailedAsk(state: SendState): SendState {
   const askFailures = state.askFailures + 1
-  if (askFailures > MAX_ASKS) {
-    // A rota ja respondeu antes: o desfecho existe e vai aparecer. Parar com o rascunho
-    // guardado e honesto; inferir pela sessao seria trocar uma resposta definitiva
-    // ausente por um palpite capaz de apagar a fala.
-    if (state.trusted) return park(state, 'exhausted')
-    return { ...state, phase: 'probe', waitMs: 0, askFailures }
-  }
+  if (askFailures > MAX_ASKS) return park({ ...state, askFailures }, 'exhausted')
   return {
     ...state,
     phase: 'wait',
@@ -227,6 +240,9 @@ export function reduce(state: SendState, event: SendEvent): SendState {
       transcript: state.transcript,
       anchorRevision: state.anchorRevision,
       needsRefresh: state.needsRefresh,
+      // Rota ausente e fato do servidor, nao do estado da tentativa: reabrir a escada nao
+      // faz o 404 desaparecer. Zerar aqui devolvia a inferencia a um caminho ja fechado.
+      inferable: state.inferable,
     }
   }
 
@@ -242,17 +258,17 @@ export function reduce(state: SendState, event: SendEvent): SendState {
     case 'ask': {
       // Resposta definitiva do servidor sobre ESTE id — nao inferencia sobre a sessao.
       if (event.kind === 'status-done') {
-        const answered = { ...state, trusted: true }
-        if (event.turnStatus === 202) return accept(answered, event.transcript)
-        return fromHttp(answered, event.turnStatus)
+        if (event.turnStatus === 202) return accept(state, event.transcript)
+        return fromHttp(state, event.turnStatus)
       }
-      if (event.kind === 'status-pending') return afterPendingAsk({ ...state, trusted: true })
-      if (event.kind === 'status-unknown') {
-        return afterInconclusiveProbe({ ...state, trusted: true })
+      if (event.kind === 'status-pending') return afterPendingAsk(state)
+      if (event.kind === 'status-unknown') return afterInconclusiveProbe(state)
+      // 404 na rota por id: o servidor respondeu, e a resposta foi "nao tenho essa rota".
+      // Servidor anterior a esta versao, entao o caminho antigo — inferir pela revision da
+      // sessao — e tudo o que resta. Unico lugar do codigo que liga `inferable`.
+      if (event.kind === 'status-missing') {
+        return { ...state, phase: 'probe', waitMs: 0, inferable: true }
       }
-      // Rota ausente (servidor anterior a esta versao): o caminho antigo, que infere pela
-      // revision da sessao, e tudo o que resta.
-      if (event.kind === 'status-missing') return { ...state, phase: 'probe', waitMs: 0 }
       if (event.kind === 'status-failed') return afterFailedAsk(state)
       return state
     }
