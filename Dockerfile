@@ -93,6 +93,12 @@ COPY hostproxy.py /app/hostproxy.py
 # hermes-boot.sh: sobe Tailscale userspace (tailnet-only) + hostproxy e encadeia
 # o start.sh original. É o startCommand do railway.toml. Ver projects/apps/hermes/FORK.md.
 COPY hermes-boot.sh /app/hermes-boot.sh
+
+# iris-inert.py: modo inerte (IRIS_INERT=1) — respondedor de /health e nada mais.
+# E o caminho de rollback da migracao para a Hetzner: da `railway ssh` no volume
+# sem subir gateway/bridge/scheduler. Precisa responder /health porque o
+# railway.toml tem healthcheckPath + restartPolicyType=on_failure.
+COPY iris-inert.py /app/iris-inert.py
 RUN chmod +x /app/hermes-boot.sh
 
 # tailscale-checksums.txt: pin de supply chain. O hermes-boot.sh verifica o tarball
